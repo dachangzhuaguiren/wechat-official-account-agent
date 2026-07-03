@@ -12,6 +12,7 @@ const staticFiles = new Map([
   ["/app.js", ["frontend/public/app.js", "text/javascript; charset=utf-8"]],
   ["/mock-agent.js", ["frontend/public/mock-agent.js", "text/javascript; charset=utf-8"]],
   ["/styles.css", ["frontend/styles/globals.css", "text/css; charset=utf-8"]],
+  ["/vendor/phosphor-regular.woff2", ["frontend/public/vendor/phosphor-regular.woff2", "font/woff2"]],
 ]);
 
 function json(response, status, value, extraHeaders = {}) {

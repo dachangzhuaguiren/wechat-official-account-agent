@@ -9,6 +9,7 @@ const required = [
   "frontend/public/app.js",
   "frontend/public/mock-agent.js",
   "frontend/styles/globals.css",
+  "frontend/public/vendor/phosphor-regular.woff2",
   ".github/workflows/pages.yml",
 ];
 

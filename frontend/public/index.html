@@ -8,28 +8,28 @@
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <div id="loading" class="app-loading"><span class="brand-mark">写</span><p>正在打开本地工作区…</p></div>
+    <div id="loading" class="app-loading"><span class="brand-mark"><i class="ph ph-pen-nib" aria-hidden="true"></i></span><p>正在打开本地工作区…</p></div>
     <div id="app" class="app-shell" hidden>
       <div id="sidebar-wrap" class="sidebar-wrap">
         <aside class="sidebar">
-          <div class="brand-lockup"><span class="brand-mark" aria-hidden="true">写</span><span>公众号写作 Agent</span></div>
-          <button id="new-project" class="new-project-button" type="button"><span aria-hidden="true">＋</span>新建文章</button>
+          <div class="brand-lockup"><span class="brand-mark" aria-hidden="true"><i class="ph ph-pen-nib"></i></span><span>写作 Agent</span><i class="ph ph-caret-down brand-caret" aria-hidden="true"></i></div>
+          <button id="new-project" class="new-project-button" type="button"><i class="ph ph-plus" aria-hidden="true"></i>新建文章</button>
           <nav class="sidebar-nav" aria-label="工作区">
-            <button type="button" class="nav-row active-static"><span aria-hidden="true">▱</span>项目</button>
-            <button id="brand-settings" type="button" class="nav-row"><span aria-hidden="true">◒</span>品牌档案</button>
+            <button type="button" class="nav-row active-static"><i class="ph ph-squares-four" aria-hidden="true"></i>项目</button>
+            <button id="brand-settings" type="button" class="nav-row"><i class="ph ph-identification-card" aria-hidden="true"></i>品牌档案</button>
           </nav>
           <div id="project-list" class="project-list" aria-label="项目列表"></div>
           <div class="sidebar-footer">
             <div class="backup-actions">
-              <button id="export-backup" type="button" class="icon-text-button">↓ 导出备份</button>
-              <label class="icon-text-button file-label">↑ 导入<input id="import-backup" type="file" accept="application/json" /></label>
+              <button id="export-backup" type="button" class="icon-text-button"><i class="ph ph-download-simple" aria-hidden="true"></i>导出</button>
+              <label class="icon-text-button file-label"><i class="ph ph-upload-simple" aria-hidden="true"></i>导入<input id="import-backup" type="file" accept="application/json" /></label>
             </div>
-            <p><span aria-hidden="true">⌁</span>数据仅保存在此浏览器</p>
+            <p><i class="ph ph-hard-drive" aria-hidden="true"></i>数据仅保存在此浏览器</p>
           </div>
         </aside>
       </div>
       <button id="sidebar-scrim" class="sidebar-scrim" type="button" aria-label="关闭项目栏"></button>
-      <button id="mobile-menu" class="mobile-menu" type="button" aria-label="打开项目栏">☰</button>
+      <button id="mobile-menu" class="mobile-menu" type="button" aria-label="打开项目栏"><i class="ph ph-list" aria-hidden="true"></i></button>
       <div id="mobile-tabs" class="mobile-tabs" aria-label="移动端工作区切换">
         <button type="button" class="selected" data-mobile-view="agent">Agent</button>
         <button type="button" data-mobile-view="canvas">正文</button>

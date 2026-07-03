@@ -8,12 +8,14 @@ if (!outputDir.startsWith(`${projectRoot}${path.sep}`)) throw new Error("Pages è
 
 await rm(outputDir, { recursive: true, force: true });
 await mkdir(outputDir, { recursive: true });
+await mkdir(path.join(outputDir, "vendor"), { recursive: true });
 
 for (const [source, target] of [
   ["frontend/public/index.html", "index.html"],
   ["frontend/public/app.js", "app.js"],
   ["frontend/public/mock-agent.js", "mock-agent.js"],
   ["frontend/styles/globals.css", "styles.css"],
+  ["frontend/public/vendor/phosphor-regular.woff2", "vendor/phosphor-regular.woff2"],
 ]) {
   await copyFile(path.join(projectRoot, source), path.join(outputDir, target));
 }

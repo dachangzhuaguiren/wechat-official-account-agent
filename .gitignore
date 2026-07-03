@@ -3,4 +3,5 @@ node_modules/
 dist/
 .env.local
 coverage/
+output/
 *.log

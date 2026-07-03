@@ -23,6 +23,7 @@ const uid = () => crypto.randomUUID();
 const now = () => new Date().toISOString();
 const escapeHtml = (value = "") => String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" })[char]);
 const activeProject = () => workspace.projects.find((project) => project.id === workspace.activeProjectId);
+const icon = (name) => `<i class="ph ph-${name}" aria-hidden="true"></i>`;
 
 function sanitizeArticleClient(value) {
   const allowed = new Set(["H1", "H2", "P", "STRONG", "B", "EM", "I", "BLOCKQUOTE", "UL", "OL", "LI", "A", "BR", "HR", "DIV"]);
@@ -113,7 +114,7 @@ function showToast(message, type = "success") {
 
 function openModal(title, content, setup, wide = false) {
   const root = $("#modal-root");
-  root.innerHTML = `<div class="modal-backdrop"><section class="modal ${wide ? "modal-wide" : ""}" role="dialog" aria-modal="true" aria-label="${escapeHtml(title)}"><header class="modal-header"><h2>${escapeHtml(title)}</h2><button class="icon-button modal-close" type="button" aria-label="关闭">×</button></header>${content}</section></div>`;
+  root.innerHTML = `<div class="modal-backdrop"><section class="modal ${wide ? "modal-wide" : ""}" role="dialog" aria-modal="true" aria-label="${escapeHtml(title)}"><header class="modal-header"><h2>${escapeHtml(title)}</h2><button class="icon-button modal-close" type="button" aria-label="关闭">${icon("x")}</button></header>${content}</section></div>`;
   $(".modal-backdrop", root).addEventListener("mousedown", (event) => { if (event.target.classList.contains("modal-backdrop")) closeModal(); });
   $(".modal-close", root).addEventListener("click", closeModal);
   setup?.(root);
@@ -125,8 +126,7 @@ function renderSidebar() {
   const list = $("#project-list");
   list.innerHTML = `<div class="section-label">最近项目</div>${workspace.projects.length ? workspace.projects.map((project) => `
     <button type="button" class="project-row ${project.id === workspace.activeProjectId ? "selected" : ""}" data-project-id="${project.id}">
-      <span class="project-title">${escapeHtml(project.title)}</span>
-      <span class="project-meta">${project.campaignType === "product" ? "产品宣传" : "活动宣传"} · ${STATUS_LABELS[project.status]}</span>
+      ${icon("folder")}<span class="project-row-copy"><span class="project-title">${escapeHtml(project.title)}</span><span class="project-meta">${project.campaignType === "product" ? "产品宣传" : "活动宣传"} · ${STATUS_LABELS[project.status]}</span></span>
     </button>`).join("") : '<p class="empty-projects">还没有文章项目</p>'}`;
   $$('[data-project-id]', list).forEach((button) => button.addEventListener("click", () => {
     workspace.activeProjectId = button.dataset.projectId;
@@ -190,21 +190,33 @@ function renderAgent() {
   const panel = $("#agent-panel");
   const project = activeProject();
   if (!project) {
-    panel.innerHTML = `<div class="empty-agent"><div class="agent-empty-icon">✦</div><h1>从一个粗浅想法开始</h1><p>建立项目后，Agent 会一次追问一个关键问题，再整理成可确认的营销简报。</p></div>`;
+    panel.innerHTML = `<header class="agent-header"><div class="agent-title"><h1>Agent</h1><span><b></b>在线</span></div></header><div class="empty-agent"><div class="agent-empty-icon">${icon("sparkle")}</div><h1>从一个粗浅想法开始</h1><p>建立项目后，Agent 会一次追问一个关键问题，再整理成可确认的营销简报。</p></div>`;
     return;
   }
   const step = currentStep(project.status);
-  panel.innerHTML = `<header class="agent-header"><div><h1>${escapeHtml(project.title)}</h1><span>已自动保存</span></div><button id="asset-upload-button" class="icon-button" type="button" title="添加图片素材">▧＋</button><input id="asset-file" hidden type="file" accept="image/*"></header>
-    <div class="workflow-steps">${STEPS.map((label, index) => `<div class="${index === step ? "current" : ""} ${index < step ? "done" : ""}"><span>${index < step ? "✓" : index + 1}</span>${label}</div>`).join("")}</div>
-    <div class="agent-scroll"><div class="idea-source"><span>最初想法</span><p>${escapeHtml(project.idea)}</p></div>
-      ${project.messages.map((message) => `<div class="message ${message.role}"><span class="message-avatar">${message.role === "agent" ? "✦" : "你"}</span><div><span class="message-role">${message.role === "agent" ? "Agent" : "你"}</span><p>${escapeHtml(message.text)}</p></div></div>`).join("")}
-      ${agentStatusContent(project)}
-    </div>${project.status === "interview" ? `<div class="agent-composer"><textarea id="agent-answer" rows="2" placeholder="回复 Agent…"></textarea><button id="send-answer" type="button" ${busy ? "disabled" : ""}>${busy ? "◌" : "➤"}</button></div>` : ""}`;
+  const inspectorContext = project.status === "draft" && project.brief
+    ? draftInspectorSummary(project)
+    : `<div class="idea-source"><span>最初想法</span><p>${escapeHtml(project.idea)}</p></div>
+      ${project.messages.map((message) => `<div class="message ${message.role}"><span class="message-avatar">${message.role === "agent" ? icon("sparkle") : "你"}</span><div><span class="message-role">${message.role === "agent" ? "Agent" : "你"}</span><p>${escapeHtml(message.text)}</p></div></div>`).join("")}`;
+  panel.innerHTML = `<header class="agent-header"><div class="agent-title"><h1>Agent</h1><span><b></b>在线</span></div><button id="asset-upload-button" class="icon-button" type="button" title="添加图片素材" aria-label="添加图片素材">${icon("image")}</button><input id="asset-file" hidden type="file" accept="image/*"></header>
+    <div class="workflow-steps">${STEPS.map((label, index) => `<div class="${index === step ? "current" : ""} ${index < step ? "done" : ""}"><span>${index < step ? icon("check") : index + 1}</span>${label}</div>`).join("")}</div>
+    <div class="agent-scroll">${inspectorContext}${agentStatusContent(project)}
+    </div>${project.status === "interview" ? `<div class="agent-composer"><textarea id="agent-answer" rows="2" placeholder="回复 Agent…"></textarea><button id="send-answer" type="button" aria-label="发送回复" ${busy ? "disabled" : ""}>${busy ? icon("circle-notch") : icon("arrow-up")}</button></div>` : ""}`;
   bindAgentEvents(project);
 }
 
+function draftInspectorSummary(project) {
+  const brief = project.brief;
+  return `<section class="inspector-brief"><div class="section-row"><h2>当前创作简报</h2><span>已确认</span></div><dl>
+    <div><dt>主题</dt><dd>${escapeHtml(brief.subject)}</dd></div>
+    <div><dt>目标读者</dt><dd>${escapeHtml(brief.audience)}</dd></div>
+    <div><dt>核心卖点</dt><dd>${escapeHtml(brief.keyMessage)}</dd></div>
+    <div><dt>风格语气</dt><dd>${escapeHtml(workspace.brand.tone)}</dd></div>
+  </dl></section>`;
+}
+
 function agentStatusContent(project) {
-  if (project.status === "idea") return `<div class="action-block"><h2>准备开始访谈</h2><p>Agent 将结合品牌档案，在五个问题内补齐文章所需事实。</p><button id="start-interview" class="button primary" type="button" ${busy ? "disabled" : ""}>${busy ? "◌ 正在准备" : "✦ 开始梳理"}</button></div>`;
+  if (project.status === "idea") return `<div class="action-block"><h2>准备开始访谈</h2><p>Agent 将结合品牌档案，在五个问题内补齐文章所需事实。</p><button id="start-interview" class="button primary" type="button" ${busy ? "disabled" : ""}>${busy ? `${icon("circle-notch")} 正在准备` : `${icon("sparkle")} 开始梳理`}</button></div>`;
   if (project.status === "brief" && project.brief) {
     const brief = project.brief;
     return `<div class="brief-form"><div class="section-row"><h2>确认营销简报</h2><span>${brief.missingFacts.length ? `${brief.missingFacts.length} 项待补` : "信息完整"}</span></div>
@@ -216,16 +228,16 @@ function agentStatusContent(project) {
       ${brief.campaignType === "event" ? `<label>活动信息<textarea data-brief="eventDetails" rows="3">${escapeHtml(brief.eventDetails)}</textarea></label>` : ""}
       <label>行动指令<input data-brief="cta" value="${escapeHtml(brief.cta)}"></label>
       ${brief.missingFacts.length ? `<div class="missing-facts">待补充：${escapeHtml(brief.missingFacts.join("、"))}</div>` : ""}
-      <button id="confirm-brief" class="button primary full" type="button" ${busy ? "disabled" : ""}>${busy ? "◌ 正在生成" : "✓ 确认并生成方向"}</button></div>`;
+      <button id="confirm-brief" class="button primary full" type="button" ${busy ? "disabled" : ""}>${busy ? `${icon("circle-notch")} 正在生成` : `${icon("check")} 确认并生成方向`}</button></div>`;
   }
-  if (project.status === "directions") return `<div class="direction-list"><h2>选择标题与叙事方向</h2>${project.directions.map((direction) => `<button data-direction="${direction.id}" class="direction-option ${direction.id === project.selectedDirectionId ? "selected" : ""}" type="button"><span>${escapeHtml(direction.angle)}</span><strong>${escapeHtml(direction.title)}</strong><ol>${direction.outline.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ol></button>`).join("")}<button id="generate-draft" class="button primary full" type="button" ${!project.selectedDirectionId || busy ? "disabled" : ""}>${busy ? "◌ 正在写作" : "生成正文 →"}</button></div>`;
+  if (project.status === "directions") return `<div class="direction-list"><h2>选择标题与叙事方向</h2>${project.directions.map((direction) => `<button data-direction="${direction.id}" class="direction-option ${direction.id === project.selectedDirectionId ? "selected" : ""}" type="button"><span>${escapeHtml(direction.angle)}</span><strong>${escapeHtml(direction.title)}</strong><ol>${direction.outline.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ol></button>`).join("")}<button id="generate-draft" class="button primary full" type="button" ${!project.selectedDirectionId || busy ? "disabled" : ""}>${busy ? `${icon("circle-notch")} 正在写作` : `生成正文 ${icon("arrow-right")}`}</button></div>`;
   if (project.status === "draft") return draftAgentContent(project);
   return "";
 }
 
 function draftAgentContent(project) {
-  const assets = project.assets.length ? `<div class="asset-strip"><div class="section-row"><h2>图片素材</h2><span>${project.assets.length}/8</span></div>${project.assets.map((asset) => `<div class="asset-row"><img src="${asset.dataUrl}" alt="${escapeHtml(asset.description)}"><div><strong>${escapeHtml(asset.name)}</strong><p>${escapeHtml(asset.description)}</p></div><button data-remove-asset="${asset.id}" type="button">×</button></div>`).join("")}</div>` : "";
-  const rewrite = rewritePreview ? `<div class="rewrite-preview"><div><span>原文</span><p>${escapeHtml(rewritePreview.original)}</p></div><div class="replacement"><span>修改后</span><p>${escapeHtml(rewritePreview.replacement)}</p></div><div class="preview-actions"><button id="cancel-rewrite" class="button secondary" type="button">取消</button><button id="apply-rewrite" class="button primary" type="button">接受修改</button></div></div>` : selectedText ? `<blockquote class="selection-quote">${escapeHtml(selectedText)}</blockquote><div class="rewrite-presets">${["表达更自然", "缩短并精简", "扩写细节", "更有号召力"].map((label) => `<button data-rewrite="${label}" type="button" ${busy ? "disabled" : ""}>${label}</button>`).join("")}</div><div class="custom-instruction"><input id="rewrite-instruction" placeholder="输入自定义修改要求"><button id="send-rewrite" type="button">➤</button></div>` : '<p class="selection-tip">在右侧文章中选中文字，即可预览 AI 改写。</p>';
+  const assets = project.assets.length ? `<div class="asset-strip"><div class="section-row"><h2>图片素材</h2><span>${project.assets.length}/8</span></div>${project.assets.map((asset) => `<div class="asset-row"><img src="${asset.dataUrl}" alt="${escapeHtml(asset.description)}"><div><strong>${escapeHtml(asset.name)}</strong><p>${escapeHtml(asset.description)}</p></div><button data-remove-asset="${asset.id}" type="button" aria-label="移除素材">${icon("x")}</button></div>`).join("")}</div>` : "";
+  const rewrite = rewritePreview ? `<div class="rewrite-preview"><div><span>原文</span><p>${escapeHtml(rewritePreview.original)}</p></div><div class="replacement"><span>修改后</span><p>${escapeHtml(rewritePreview.replacement)}</p></div><div class="preview-actions"><button id="cancel-rewrite" class="button secondary" type="button">取消</button><button id="apply-rewrite" class="button primary" type="button">接受修改</button></div></div>` : selectedText ? `<blockquote class="selection-quote">${escapeHtml(selectedText)}</blockquote><div class="rewrite-presets">${["表达更自然", "缩短并精简", "扩写细节", "更有号召力"].map((label, index) => `<button data-rewrite="${label}" type="button" ${busy ? "disabled" : ""}>${icon(["pencil-simple", "list", "article", "magic-wand"][index])}${label}</button>`).join("")}</div><div class="custom-instruction"><input id="rewrite-instruction" placeholder="输入自定义修改要求"><button id="send-rewrite" type="button" aria-label="发送修改要求">${icon("arrow-up")}</button></div>` : `<p class="selection-tip">${icon("pencil-simple")}在正文中选中文字，即可预览 AI 改写。</p>`;
   return `<div class="rewrite-workspace">${assets}<h2>局部 AI 修改</h2>${rewrite}</div>`;
 }
 
@@ -323,7 +335,7 @@ function renderCanvas() {
 }
 
 function canvasHeader(project) {
-  return `<header class="canvas-header"><div class="canvas-title"><span>▤</span><span>${project ? "公众号文章" : "创作画布"}</span></div>${project?.status === "draft" ? `<div class="canvas-actions"><button id="audit-article" class="button quiet" type="button" ${busy ? "disabled" : ""}>⌕ 发布检查</button><button id="preview-article" class="button quiet" type="button">◉ 预览</button><button id="copy-article" class="button dark" type="button" ${busy || project.auditIssues.some((issue) => issue.severity === "blocking") ? "disabled" : ""}>▣ 复制到公众号</button></div>` : ""}</header>`;
+  return `<header class="canvas-header"><div class="canvas-title">${icon("file-text")}<span>${project ? escapeHtml(project.title) : "未命名文章"}</span>${project ? `<small>${icon("clock")} 已自动保存</small>` : ""}</div>${project?.status === "draft" ? `<div class="canvas-actions"><button id="preview-article" class="button quiet" type="button">${icon("eye")} 预览</button><button id="audit-article" class="button quiet" type="button" ${busy ? "disabled" : ""}>${icon("shield-check")} 审核</button><button id="copy-article" class="button dark" type="button" ${busy || project.auditIssues.some((issue) => issue.severity === "blocking") ? "disabled" : ""}>${icon("copy")} 复制到公众号</button></div>` : ""}</header>`;
 }
 
 function renderCanvasHeaderOnly() {
@@ -332,18 +344,23 @@ function renderCanvasHeaderOnly() {
 }
 
 function canvasBody(project) {
-  if (!project) return `<div class="welcome-canvas" style="--brand-primary:${workspace.brand.primaryColor};--brand-accent:${workspace.brand.accentColor}"><div class="art-field art-one"></div><div class="art-field art-two"></div><div class="welcome-copy"><span class="welcome-icon">✦</span><h2>把零散想法，整理成一篇可以继续编辑的文章。</h2><p>从左侧新建项目。Agent 会先确认事实，再和你一起完成标题、提纲与正文。</p></div></div>`;
+  if (!project) return `<div class="welcome-canvas"><div class="welcome-copy"><span class="welcome-icon">${icon("article")}</span><h2>把零散想法，整理成一篇可以继续编辑的文章。</h2><p>从左侧新建项目。Agent 会先确认事实，再和你一起完成标题、提纲与正文。</p><button id="welcome-new-project" class="button dark" type="button">${icon("plus")} 新建文章</button></div></div>`;
   if (project.status === "draft") {
     const blocking = project.auditIssues.some((issue) => issue.severity === "blocking");
-    return `<div class="article-stage">${project.auditIssues.length ? `<div class="audit-banner">${blocking ? "⚠" : "✓"}<div>${project.auditIssues.map((issue) => `<p>${escapeHtml(issue.message)}${issue.excerpt ? `（${escapeHtml(issue.excerpt)}）` : ""}</p>`).join("")}</div></div>` : ""}<div class="editor-frame"><div class="editor-toolbar" role="toolbar" aria-label="文章格式"><button data-command="undo" title="撤销" aria-label="撤销">↶</button><button data-command="redo" title="重做" aria-label="重做">↷</button><span class="toolbar-divider"></span><button data-command="formatBlock" data-value="H1" title="一级标题" aria-label="一级标题">H1</button><button data-command="formatBlock" data-value="H2" title="二级标题" aria-label="二级标题">H2</button><button data-command="bold" title="加粗" aria-label="加粗"><b>B</b></button><button data-command="italic" title="斜体" aria-label="斜体"><i>I</i></button><button id="create-link" title="链接" aria-label="链接">⌁</button><button data-command="insertUnorderedList" title="无序列表" aria-label="无序列表">☷</button><button data-command="insertOrderedList" title="有序列表" aria-label="有序列表">☰</button><button data-command="formatBlock" data-value="BLOCKQUOTE" title="引用" aria-label="引用">❞</button></div><div id="article-editor" class="article-prose" contenteditable="true" role="textbox" aria-label="公众号文章正文" aria-multiline="true" data-placeholder="正文会在这里生成，你也可以直接开始写作……">${sanitizeArticleClient(project.articleHtml)}</div><button id="selection-bubble" class="bubble-ai" type="button" hidden>✦ AI 修改</button></div></div>`;
+    return `<div class="article-stage">${project.auditIssues.length ? `<div class="audit-banner">${blocking ? icon("warning") : icon("check")}<div>${project.auditIssues.map((issue) => `<p>${escapeHtml(issue.message)}${issue.excerpt ? `（${escapeHtml(issue.excerpt)}）` : ""}</p>`).join("")}</div></div>` : ""}<div class="editor-frame"><div class="editor-toolbar" role="toolbar" aria-label="文章格式"><button data-command="formatBlock" data-value="P" class="text-style-control" title="正文" aria-label="正文">正文 ${icon("caret-down")}</button><span class="toolbar-divider"></span><button data-command="undo" title="撤销" aria-label="撤销">${icon("arrow-counter-clockwise")}</button><button data-command="redo" title="重做" aria-label="重做">${icon("arrow-clockwise")}</button><span class="toolbar-divider"></span><button data-command="formatBlock" data-value="H1" title="一级标题" aria-label="一级标题">${icon("text-h-one")}</button><button data-command="formatBlock" data-value="H2" title="二级标题" aria-label="二级标题">${icon("text-h-two")}</button><button data-command="bold" title="加粗" aria-label="加粗">${icon("text-bolder")}</button><button data-command="italic" title="斜体" aria-label="斜体">${icon("text-italic")}</button><button id="create-link" title="链接" aria-label="链接">${icon("link")}</button><button data-command="insertUnorderedList" title="无序列表" aria-label="无序列表">${icon("list-bullets")}</button><button data-command="insertOrderedList" title="有序列表" aria-label="有序列表">${icon("list-numbers")}</button><button data-command="formatBlock" data-value="BLOCKQUOTE" title="引用" aria-label="引用">${icon("quotes")}</button></div><div id="article-editor" class="article-prose" contenteditable="true" role="textbox" aria-label="公众号文章正文" aria-multiline="true" data-placeholder="正文会在这里生成，你也可以直接开始写作……">${sanitizeArticleClient(project.articleHtml)}</div><button id="selection-bubble" class="bubble-ai" type="button" hidden>${icon("sparkle")} AI 修改</button></div><footer class="article-status"><span>字数 ${articleTextLength(project.articleHtml)}</span><span>已保存 ${icon("check")}</span></footer></div>`;
   }
   if (project.status === "brief" && project.brief) return `<div class="process-sheet" style="--brand-primary:${workspace.brand.primaryColor}"><div class="sheet-kicker">营销简报</div><h2>${escapeHtml(project.brief.subject)}</h2><dl><div><dt>目标读者</dt><dd>${escapeHtml(project.brief.audience)}</dd></div><div><dt>传播目标</dt><dd>${escapeHtml(project.brief.objective)}</dd></div><div><dt>核心信息</dt><dd>${escapeHtml(project.brief.keyMessage)}</dd></div><div><dt>行动指令</dt><dd>${escapeHtml(project.brief.cta)}</dd></div></dl></div>`;
   if (project.status === "directions") return `<div class="process-sheet directions-sheet" style="--brand-primary:${workspace.brand.primaryColor}"><div class="sheet-kicker">三个传播方向</div><h2>先选准叙事角度，再生成整篇正文。</h2>${project.directions.map((direction, index) => `<section><span>0${index + 1}</span><div><h3>${escapeHtml(direction.title)}</h3><p>${escapeHtml(direction.angle)} · ${escapeHtml(direction.outline.join(" / "))}</p></div></section>`).join("")}</div>`;
-  return `<div class="process-placeholder" style="--brand-primary:${workspace.brand.primaryColor};--brand-accent:${workspace.brand.accentColor}"><div class="document-ghost"><div class="ghost-accent"></div><div class="ghost-line wide"></div><div class="ghost-line medium"></div><div class="ghost-space"></div><div class="ghost-line short"></div><div class="ghost-line wide"></div><div class="ghost-line medium"></div></div><div class="process-caption"><span>▧</span><p>回答左侧问题后，营销简报会先在这里成形。</p></div></div>`;
+  return `<div class="process-placeholder"><div class="process-empty"><span>${icon("file-text")}</span><h2>文章将在这里逐步成形</h2><p>回答右侧 Agent 的问题后，营销简报、内容方向和正文会依次出现在写作画布中。</p></div></div>`;
+}
+
+function articleTextLength(articleHtml) {
+  return new DOMParser().parseFromString(String(articleHtml || ""), "text/html").body.innerText.replace(/\s/g, "").length;
 }
 
 function bindCanvasEvents(project) {
   bindCanvasHeader(project);
+  $("#welcome-new-project")?.addEventListener("click", showNewProject);
   const editor = $("#article-editor"); if (!editor) return;
   editor.addEventListener("input", () => { project.articleHtml = editor.innerHTML; project.auditIssues = []; project.updatedAt = now(); $(".audit-banner")?.remove(); scheduleSave(); renderCanvasHeaderOnly(); });
   ["mouseup", "keyup"].forEach((eventName) => editor.addEventListener(eventName, captureSelection));
