@@ -15,7 +15,9 @@ let selectedRange;
 let selectedText = "";
 let rewritePreview;
 let saveTimer;
-let staticAgentMode = location.protocol === "file:" || location.hostname.endsWith(".github.io");
+const configuredApiBaseUrl = String(window.AGENT_CONFIG?.apiBaseUrl || "").replace(/\/$/, "");
+const remoteAgentConfigured = Boolean(configuredApiBaseUrl);
+let staticAgentMode = location.protocol === "file:" || (location.hostname.endsWith(".github.io") && !remoteAgentConfigured);
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -76,27 +78,48 @@ function updateProject(id, updater) {
 
 async function api(operation, payload) {
   if (staticAgentMode) return runStaticAgentOperation(operation, payload);
+  let accessToken = "";
+  if (remoteAgentConfigured) {
+    accessToken = sessionStorage.getItem("agent-access-token") || "";
+    if (!accessToken) {
+      accessToken = String(window.prompt("请输入写作 Agent 访问码。它不是 DeepSeek API Key。") || "").trim();
+      if (!accessToken) throw new Error("需要访问码才能使用真实 AI");
+      sessionStorage.setItem("agent-access-token", accessToken);
+    }
+  }
   try {
-    const response = await fetch(`./api/agent/${operation}`, {
+    const response = await fetch(`${configuredApiBaseUrl || "."}/api/agent/${operation}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+      },
       body: JSON.stringify(payload),
     });
     const isJson = response.headers.get("content-type")?.includes("application/json");
-    if (response.status === 404 && !isJson) {
+    if (!remoteAgentConfigured && response.status === 404 && !isJson) {
       staticAgentMode = true;
       return runStaticAgentOperation(operation, payload);
     }
     const result = isJson ? await response.json() : { error: "服务返回了无法解析的响应" };
+    if (remoteAgentConfigured && response.status === 401) {
+      sessionStorage.removeItem("agent-access-token");
+      throw new Error("访问码不正确，请重新操作并输入正确的访问码");
+    }
     if (!response.ok) throw new Error(result.error || "Agent 请求失败");
     return result;
   } catch (error) {
-    if (error instanceof TypeError) {
+    if (!remoteAgentConfigured && error instanceof TypeError) {
       staticAgentMode = true;
       return runStaticAgentOperation(operation, payload);
     }
     throw error;
   }
+}
+
+function agentStatusLabel() {
+  if (remoteAgentConfigured) return "DeepSeek V4";
+  return staticAgentMode ? "演示模式" : "本地 AI";
 }
 
 async function runTask(task) {
@@ -190,7 +213,7 @@ function renderAgent() {
   const panel = $("#agent-panel");
   const project = activeProject();
   if (!project) {
-    panel.innerHTML = `<header class="agent-header"><div class="agent-title"><h1>Agent</h1><span><b></b>在线</span></div></header><div class="empty-agent"><div class="agent-empty-icon">${icon("sparkle")}</div><h1>从一个粗浅想法开始</h1><p>建立项目后，Agent 会一次追问一个关键问题，再整理成可确认的营销简报。</p></div>`;
+    panel.innerHTML = `<header class="agent-header"><div class="agent-title"><h1>Agent</h1><span><b></b>${agentStatusLabel()}</span></div></header><div class="empty-agent"><div class="agent-empty-icon">${icon("sparkle")}</div><h1>从一个粗浅想法开始</h1><p>建立项目后，Agent 会一次追问一个关键问题，再整理成可确认的营销简报。</p></div>`;
     return;
   }
   const step = currentStep(project.status);
@@ -198,7 +221,7 @@ function renderAgent() {
     ? draftInspectorSummary(project)
     : `<div class="idea-source"><span>最初想法</span><p>${escapeHtml(project.idea)}</p></div>
       ${project.messages.map((message) => `<div class="message ${message.role}"><span class="message-avatar">${message.role === "agent" ? icon("sparkle") : "你"}</span><div><span class="message-role">${message.role === "agent" ? "Agent" : "你"}</span><p>${escapeHtml(message.text)}</p></div></div>`).join("")}`;
-  panel.innerHTML = `<header class="agent-header"><div class="agent-title"><h1>Agent</h1><span><b></b>在线</span></div><button id="asset-upload-button" class="icon-button" type="button" title="添加图片素材" aria-label="添加图片素材">${icon("image")}</button><input id="asset-file" hidden type="file" accept="image/*"></header>
+  panel.innerHTML = `<header class="agent-header"><div class="agent-title"><h1>Agent</h1><span><b></b>${agentStatusLabel()}</span></div><button id="asset-upload-button" class="icon-button" type="button" title="添加图片素材" aria-label="添加图片素材">${icon("image")}</button><input id="asset-file" hidden type="file" accept="image/*"></header>
     <div class="workflow-steps">${STEPS.map((label, index) => `<div class="${index === step ? "current" : ""} ${index < step ? "done" : ""}"><span>${index < step ? icon("check") : index + 1}</span>${label}</div>`).join("")}</div>
     <div class="agent-scroll">${inspectorContext}${agentStatusContent(project)}
     </div>${project.status === "interview" ? `<div class="agent-composer"><textarea id="agent-answer" rows="2" placeholder="回复 Agent…"></textarea><button id="send-answer" type="button" aria-label="发送回复" ${busy ? "disabled" : ""}>${busy ? icon("circle-notch") : icon("arrow-up")}</button></div>` : ""}`;

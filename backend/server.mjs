@@ -1,4 +1,5 @@
 import http from "node:http";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -10,6 +11,7 @@ const staticFiles = new Map([
   ["/", ["frontend/public/index.html", "text/html; charset=utf-8"]],
   ["/index.html", ["frontend/public/index.html", "text/html; charset=utf-8"]],
   ["/app.js", ["frontend/public/app.js", "text/javascript; charset=utf-8"]],
+  ["/config.js", ["frontend/public/config.js", "text/javascript; charset=utf-8"]],
   ["/mock-agent.js", ["frontend/public/mock-agent.js", "text/javascript; charset=utf-8"]],
   ["/styles.css", ["frontend/styles/globals.css", "text/css; charset=utf-8"]],
   ["/vendor/phosphor-regular.woff2", ["frontend/public/vendor/phosphor-regular.woff2", "font/woff2"]],
@@ -48,20 +50,66 @@ function clientAddress(request, trustProxy) {
   return request.socket.remoteAddress || "unknown";
 }
 
+function parseAllowedOrigins(value) {
+  return new Set(String(value || "").split(",").map((item) => item.trim().replace(/\/$/, "")).filter(Boolean));
+}
+
+function corsHeaders(request, allowedOrigins) {
+  const origin = String(request.headers.origin || "").replace(/\/$/, "");
+  if (!origin) return {};
+  try {
+    if (new URL(origin).host === request.headers.host) return {};
+  } catch {
+    return null;
+  }
+  if (!allowedOrigins.has(origin)) return null;
+  return {
+    "access-control-allow-origin": origin,
+    "access-control-allow-methods": "GET, POST, OPTIONS",
+    "access-control-allow-headers": "authorization, content-type",
+    "access-control-max-age": "600",
+    vary: "Origin",
+  };
+}
+
+function bearerToken(request) {
+  const match = String(request.headers.authorization || "").match(/^Bearer\s+(.+)$/i);
+  return match?.[1] || "";
+}
+
+function tokensEqual(left, right) {
+  const leftBuffer = Buffer.from(String(left));
+  const rightBuffer = Buffer.from(String(right));
+  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
+}
+
 export function createServer(options = {}) {
   const rateLimitMax = Number(options.rateLimitMax ?? process.env.RATE_LIMIT_MAX ?? 30);
   const rateLimitWindowMs = Number(options.rateLimitWindowMs ?? process.env.RATE_LIMIT_WINDOW_MS ?? 60_000);
   const trustProxy = options.trustProxy ?? process.env.TRUST_PROXY === "1";
+  const providerMode = options.providerMode ?? process.env.AGENT_PROVIDER_MODE ?? "mock";
+  const accessToken = String(options.accessToken ?? process.env.AGENT_ACCESS_TOKEN ?? "");
+  const allowUnauthenticatedAgent = options.allowUnauthenticatedAgent ?? process.env.ALLOW_UNAUTHENTICATED_AGENT === "1";
+  const allowedOrigins = parseAllowedOrigins(options.allowedOrigins ?? process.env.ALLOWED_ORIGINS);
   const requestsByAddress = new Map();
 
   return http.createServer(async (request, response) => {
     const url = new URL(request.url || "/", "http://localhost");
+    const apiRequest = url.pathname.startsWith("/api/");
+    const cors = apiRequest ? corsHeaders(request, allowedOrigins) : {};
+    if (apiRequest && cors === null) return json(response, 403, { error: "请求来源不允许" });
+
+    if (request.method === "OPTIONS" && apiRequest) {
+      response.writeHead(204, { ...cors, "cache-control": "no-store" });
+      return response.end();
+    }
 
     if (request.method === "GET" && url.pathname === "/api/health") {
       return json(response, 200, {
         ok: true,
-        providerMode: process.env.AGENT_PROVIDER_MODE || "mock",
-      });
+        providerMode,
+        accessProtected: Boolean(accessToken),
+      }, cors);
     }
 
     const operation = url.pathname.match(/^\/api\/agent\/(interview|directions|draft|rewrite|audit)$/)?.[1];
@@ -77,16 +125,31 @@ export function createServer(options = {}) {
 
       if (Number.isFinite(rateLimitMax) && rateLimitMax > 0 && bucket.count > rateLimitMax) {
         const retryAfter = Math.max(1, Math.ceil((rateLimitWindowMs - (now - bucket.startedAt)) / 1000));
-        return json(response, 429, { error: "请求过于频繁，请稍后重试" }, { "retry-after": String(retryAfter) });
+        return json(response, 429, { error: "请求过于频繁，请稍后重试" }, { ...cors, "retry-after": String(retryAfter) });
+      }
+
+      if (providerMode !== "mock" && !accessToken && !allowUnauthenticatedAgent) {
+        return json(response, 503, { error: "真实 AI 服务尚未完成访问保护配置" }, cors);
+      }
+      if (accessToken && !tokensEqual(bearerToken(request), accessToken)) {
+        return json(response, 401, { error: "访问码无效" }, { ...cors, "www-authenticate": "Bearer" });
       }
 
       try {
-        return json(response, 200, await runAgentOperation(operation, await readJson(request)));
+        return json(response, 200, await runAgentOperation(operation, await readJson(request)), cors);
       } catch (error) {
-        const status = error?.code === "PAYLOAD_TOO_LARGE" ? 413 : 400;
-        return json(response, status, {
-          error: error instanceof Error ? error.message : "Agent 处理失败",
-        });
+        const requestId = randomUUID();
+        const status = error?.code === "PAYLOAD_TOO_LARGE" ? 413
+          : error?.code === "INVALID_INPUT" ? 400
+            : error?.code === "CONFIG_ERROR" ? 503
+              : error?.code === "PROVIDER_ERROR" ? 502
+                : 500;
+        console.error("Agent request failed", { requestId, operation, code: error?.code || "UNEXPECTED", name: error?.name || "Error" });
+        const errorMessage = status < 500 && error instanceof Error ? error.message
+          : status === 502 ? "AI 服务暂时不可用，请稍后重试"
+            : status === 503 ? "AI 服务尚未完成配置"
+              : "Agent 处理失败";
+        return json(response, status, { error: errorMessage, requestId }, cors);
       }
     }
 

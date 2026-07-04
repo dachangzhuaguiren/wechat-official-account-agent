@@ -20,8 +20,15 @@ for (const [source, target] of [
   await copyFile(path.join(projectRoot, source), path.join(outputDir, target));
 }
 
+const apiBaseUrl = String(process.env.AGENT_API_BASE_URL || "").replace(/\/$/, "");
+await writeFile(
+  path.join(outputDir, "config.js"),
+  `window.AGENT_CONFIG = Object.freeze(${JSON.stringify({ apiBaseUrl })});\n`,
+  "utf8",
+);
+
 const html = await readFile(path.join(outputDir, "index.html"), "utf8");
-if (!html.includes('./app.js') || !html.includes('./styles.css')) {
+if (!html.includes('./app.js') || !html.includes('./config.js') || !html.includes('./styles.css')) {
   throw new Error("GitHub Pages 产物必须使用相对资源路径");
 }
 

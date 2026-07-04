@@ -25,6 +25,8 @@ jobs:
       - run: npm test
       - run: npm run build
       - run: npm run build:pages
+        env:
+          AGENT_API_BASE_URL: ${{ vars.AGENT_API_BASE_URL }}
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v4
         with:

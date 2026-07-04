@@ -144,34 +144,101 @@ function parseJson(content) {
   return JSON.parse(String(content).trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, ""));
 }
 
-async function providerCall(messages, env) {
+function agentError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function assertObject(value, field) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw agentError("INVALID_INPUT", `${field} 格式无效`);
+}
+
+function assertString(value, field, { min = 0, max }) {
+  if (typeof value !== "string" || value.trim().length < min || value.length > max) {
+    throw agentError("INVALID_INPUT", `${field} 长度或格式无效`);
+  }
+}
+
+export function validateOperationPayload(operation, payload) {
+  assertObject(payload, "请求内容");
+  if (operation === "interview") {
+    if (!["product", "event"].includes(payload.campaignType)) throw agentError("INVALID_INPUT", "宣传类型无效");
+    assertString(payload.idea, "粗浅想法", { min: 1, max: 4000 });
+    if (!Array.isArray(payload.answers) || payload.answers.length > 8) throw agentError("INVALID_INPUT", "访谈回答格式无效");
+    for (const answer of payload.answers) {
+      assertObject(answer, "访谈回答");
+      assertString(answer.questionId, "问题编号", { min: 1, max: 80 });
+      assertString(answer.answer, "访谈回答", { min: 1, max: 4000 });
+    }
+  }
+  if (operation === "directions") assertObject(payload.brief, "营销简报");
+  if (operation === "draft") {
+    assertObject(payload.brief, "营销简报");
+    assertObject(payload.direction, "内容方向");
+    if (payload.assets !== undefined && (!Array.isArray(payload.assets) || payload.assets.length > 20)) {
+      throw agentError("INVALID_INPUT", "图片素材数量无效");
+    }
+  }
+  if (operation === "rewrite") {
+    assertString(payload.text, "待改写文本", { min: 1, max: 12000 });
+    assertString(payload.instruction, "改写要求", { min: 1, max: 1000 });
+  }
+  if (operation === "audit") assertString(payload.articleText, "文章正文", { min: 1, max: 50000 });
+  if (payload.brand !== undefined) assertObject(payload.brand, "品牌档案");
+  return payload;
+}
+
+function modelForOperation(operation, env) {
+  if (["draft", "audit"].includes(operation) && env.AGENT_MODEL_QUALITY) return env.AGENT_MODEL_QUALITY;
+  return env.AGENT_MODEL;
+}
+
+async function providerCall(messages, env, model, operation) {
   const base = String(env.AGENT_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
-  if (!env.AGENT_API_KEY || !env.AGENT_MODEL) throw new Error("模型服务尚未配置 AGENT_API_KEY 和 AGENT_MODEL");
+  if (!env.AGENT_API_KEY || !model) throw agentError("CONFIG_ERROR", "模型服务尚未完成配置");
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), Math.min(Number(env.AGENT_TIMEOUT_MS || 45000), 90000));
   try {
-    const response = await fetch(`${base}/chat/completions`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${env.AGENT_API_KEY}` }, body: JSON.stringify({ model: env.AGENT_MODEL, temperature: 0.45, messages }), signal: controller.signal });
+    const requestBody = { model, temperature: 0.45, response_format: { type: "json_object" }, messages };
+    if (env.AGENT_THINKING_MODE === "operation-based") {
+      const thinkingEnabled = ["draft", "audit"].includes(operation);
+      requestBody.thinking = { type: thinkingEnabled ? "enabled" : "disabled" };
+      if (thinkingEnabled) {
+        delete requestBody.temperature;
+        requestBody.reasoning_effort = "high";
+      }
+    }
+    const response = await fetch(`${base}/chat/completions`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${env.AGENT_API_KEY}` }, body: JSON.stringify(requestBody), signal: controller.signal });
     const body = await response.text();
-    if (!response.ok) throw new Error(`模型服务返回 ${response.status}: ${body.slice(0, 180)}`);
-    const parsed = JSON.parse(body);
+    if (!response.ok) throw agentError("PROVIDER_ERROR", `模型服务返回 ${response.status}`);
+    let parsed;
+    try { parsed = JSON.parse(body); }
+    catch { throw agentError("PROVIDER_ERROR", "模型服务返回了无效响应"); }
     const content = parsed.choices?.[0]?.message?.content;
-    if (!content) throw new Error("模型服务未返回正文");
+    if (!content) throw agentError("PROVIDER_ERROR", "模型服务未返回正文");
     return content;
+  } catch (error) {
+    if (error?.code) throw error;
+    if (error?.name === "AbortError") throw agentError("PROVIDER_ERROR", "模型服务响应超时");
+    throw agentError("PROVIDER_ERROR", "无法连接模型服务");
   } finally { clearTimeout(timeout); }
 }
 
 export async function runAgentOperation(operation, payload, env = process.env) {
   if (!Object.hasOwn(SYSTEM_PROMPTS, operation)) throw new Error("未知 Agent 操作");
+  validateOperationPayload(operation, payload);
   if ((env.AGENT_PROVIDER_MODE || "mock") === "mock") return runMockOperation(operation, payload);
+  const model = modelForOperation(operation, env);
   const messages = [
     { role: "system", content: `${SYSTEM_PROMPTS[operation]}\n必须只返回有效 JSON，不要使用 Markdown 代码块。` },
     { role: "user", content: JSON.stringify(payload) },
   ];
-  let content = await providerCall(messages, env);
+  let content = await providerCall(messages, env, model, operation);
   let result;
   try { result = validateResult(operation, parseJson(content)); }
   catch {
-    content = await providerCall([...messages, { role: "assistant", content }, { role: "user", content: "上一个结果无法通过结构校验。请修复为有效 JSON，只返回 JSON。" }], env);
+    content = await providerCall([...messages, { role: "assistant", content }, { role: "user", content: "上一个结果无法通过结构校验。请修复为有效 JSON，只返回 JSON。" }], env, model, operation);
     result = validateResult(operation, parseJson(content));
   }
   if (operation === "draft") result.articleHtml = sanitizeArticleHtml(result.articleHtml);

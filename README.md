@@ -36,14 +36,19 @@ npm start
 
 ```dotenv
 AGENT_PROVIDER_MODE=openai-compatible
-AGENT_BASE_URL=https://api.openai.com/v1
+AGENT_BASE_URL=https://api.deepseek.com
 AGENT_API_KEY=你的服务端密钥
-AGENT_MODEL=你的模型名称
+AGENT_MODEL=deepseek-v4-flash
+AGENT_MODEL_QUALITY=deepseek-v4-pro
+AGENT_THINKING_MODE=operation-based
+AGENT_ACCESS_TOKEN=另设的随机访问码
 ```
 
 密钥只应配置在服务端或托管平台的环境变量中，不能写入前端或提交到 GitHub。详细说明见 [模型接入教程](docs/lessons/0001-connect-an-openai-compatible-model.html)。
 
 ## GitHub Pages 部署
+
+要让现有 GitHub Pages 地址使用 DeepSeek V4，请按 [DeepSeek V4 部署说明](docs/deploy-deepseek-v4.md) 配置独立后端和仓库变量。API Key 只能保存在后端托管平台的 Secret 中。
 
 推送到 GitHub 仓库的 `main` 分支后，`Deploy GitHub Pages` 工作流会自动测试、构建并发布网站。项目站点默认地址为：
 
@@ -51,9 +56,7 @@ AGENT_MODEL=你的模型名称
 https://<GitHub用户名>.github.io/<仓库名>/
 ```
 
-GitHub Pages 是静态托管，公开版会自动使用浏览器内置 Mock Agent，因此不需要 API 密钥，访谈、生成方向、生成正文、局部改写和发布检查均可运行。
-
-若要启用真实模型，需要另外部署 `backend/`，并把模型密钥保存在后端环境变量中。不能把密钥写入 GitHub Pages 前端。
+GitHub Pages 是静态托管：未配置 `AGENT_API_BASE_URL` 时使用浏览器内置 Mock Agent；配置后会调用独立部署的 `backend/`。模型密钥只能保存在后端环境变量中，不能写入 GitHub Pages 前端。
 
 ## 数据说明
 

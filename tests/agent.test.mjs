@@ -65,9 +65,12 @@ test("正文清洗移除脚本、事件属性和未知标签", () => {
 
 test("OpenAI-compatible 适配器调用 chat/completions 并解析结构化结果", async (t) => {
   let authorization = "";
+  let requestPayload;
   const provider = http.createServer(async (request, response) => {
     authorization = request.headers.authorization || "";
-    for await (const _chunk of request) { /* consume body */ }
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    requestPayload = JSON.parse(body);
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ replacement: "保留事实后的自然表达" }) } }] }));
   }).listen(0, "127.0.0.1");
@@ -79,8 +82,38 @@ test("OpenAI-compatible 适配器调用 chat/completions 并解析结构化结�
     AGENT_BASE_URL: `http://127.0.0.1:${port}`,
     AGENT_API_KEY: "test-key",
     AGENT_MODEL: "test-model",
+    AGENT_THINKING_MODE: "operation-based",
     AGENT_TIMEOUT_MS: "2000",
   });
   assert.equal(result.replacement, "保留事实后的自然表达");
   assert.equal(authorization, "Bearer test-key");
+  assert.equal(requestPayload.model, "test-model");
+  assert.deepEqual(requestPayload.response_format, { type: "json_object" });
+  assert.deepEqual(requestPayload.thinking, { type: "disabled" });
+});
+
+test("成稿和审核使用质量模型", async (t) => {
+  let requestPayload;
+  const provider = http.createServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    requestPayload = JSON.parse(body);
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ articleHtml: "<h1>真实成稿</h1>" }) } }] }));
+  }).listen(0, "127.0.0.1");
+  await once(provider, "listening");
+  t.after(() => provider.close());
+  const { port } = provider.address();
+  await runAgentOperation("draft", { brief: {}, direction: {}, brand: {}, assets: [] }, {
+    AGENT_PROVIDER_MODE: "openai-compatible",
+    AGENT_BASE_URL: `http://127.0.0.1:${port}`,
+    AGENT_API_KEY: "test-key",
+    AGENT_MODEL: "deepseek-v4-flash",
+    AGENT_MODEL_QUALITY: "deepseek-v4-pro",
+    AGENT_THINKING_MODE: "operation-based",
+  });
+  assert.equal(requestPayload.model, "deepseek-v4-pro");
+  assert.deepEqual(requestPayload.thinking, { type: "enabled" });
+  assert.equal(requestPayload.reasoning_effort, "high");
+  assert.equal(Object.hasOwn(requestPayload, "temperature"), false);
 });
