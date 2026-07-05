@@ -22,6 +22,14 @@ const SYSTEM_PROMPTS = {
   audit: "你是营销事实审校员。对照营销简报检查未确认事实、绝对化表述、日期价格参数和行动信息，输出阻断项与警告。",
 };
 
+const RESULT_SCHEMAS = {
+  interview: '{"status":"question","question":{"id":"question-id","text":"一个问题","hint":"回答提示"}} 或 {"status":"brief","brief":{"campaignType":"product|event","subject":"主题","audience":"目标读者","objective":"传播目标","keyMessage":"核心信息","proofPoints":["事实依据"],"cta":"行动指令","eventDetails":"活动信息或不适用","restrictions":["限制"],"missingFacts":["仍缺事实"]}}',
+  directions: '{"directions":[{"id":"direction-id","title":"标题","angle":"叙事角度","outline":["提纲1","提纲2","提纲3"]}]}，directions 必须恰好包含三项',
+  draft: '{"articleHtml":"仅包含允许标签的完整文章 HTML"}',
+  rewrite: '{"replacement":"改写后的文本"}',
+  audit: '{"issues":[{"id":"issue-id","severity":"blocking|warning","message":"问题说明","excerpt":"相关原文，可省略"}]}',
+};
+
 function answerOf(answers, id, fallback) {
   return answers.find((answer) => answer.questionId === id)?.answer?.trim() || fallback;
 }
@@ -230,16 +238,18 @@ export async function runAgentOperation(operation, payload, env = process.env) {
   validateOperationPayload(operation, payload);
   if ((env.AGENT_PROVIDER_MODE || "mock") === "mock") return runMockOperation(operation, payload);
   const model = modelForOperation(operation, env);
+  const resultSchema = RESULT_SCHEMAS[operation];
   const messages = [
-    { role: "system", content: `${SYSTEM_PROMPTS[operation]}\n必须只返回有效 JSON，不要使用 Markdown 代码块。` },
+    { role: "system", content: `${SYSTEM_PROMPTS[operation]}\n必须只返回有效 JSON，不要使用 Markdown 代码块。输出必须严格符合以下结构，字段名不得替换：\n${resultSchema}` },
     { role: "user", content: JSON.stringify(payload) },
   ];
   let content = await providerCall(messages, env, model, operation);
   let result;
   try { result = validateResult(operation, parseJson(content)); }
   catch {
-    content = await providerCall([...messages, { role: "assistant", content }, { role: "user", content: "上一个结果无法通过结构校验。请修复为有效 JSON，只返回 JSON。" }], env, model, operation);
-    result = validateResult(operation, parseJson(content));
+    content = await providerCall([...messages, { role: "assistant", content }, { role: "user", content: `上一个结果字段不符合要求。请严格修复为以下结构，只返回 JSON：\n${resultSchema}` }], env, model, operation);
+    try { result = validateResult(operation, parseJson(content)); }
+    catch { throw agentError("PROVIDER_ERROR", "模型返回结构不符合要求"); }
   }
   if (operation === "draft") result.articleHtml = sanitizeArticleHtml(result.articleHtml);
   return result;
