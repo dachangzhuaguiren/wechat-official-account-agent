@@ -1,5 +1,6 @@
 import http from "node:http";
 import { randomUUID, timingSafeEqual } from "node:crypto";
+import { isIP } from "node:net";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -23,43 +24,82 @@ function json(response, status, value, extraHeaders = {}) {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
     "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+    "content-security-policy": "default-src 'none'; frame-ancestors 'none'",
+    "x-frame-options": "DENY",
     ...extraHeaders,
   });
   response.end(JSON.stringify(value));
 }
 
-async function readJson(request) {
-  let body = "";
+async function readJson(request, maxBytes = 1_000_000) {
+  const declaredLength = Number(request.headers["content-length"] || 0);
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    const error = new Error("请求内容过大");
+    error.code = "PAYLOAD_TOO_LARGE";
+    throw error;
+  }
+  const chunks = [];
+  let size = 0;
   for await (const chunk of request) {
-    body += chunk;
-    if (Buffer.byteLength(body, "utf8") > 1_000_000) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > maxBytes) {
       const error = new Error("请求内容过大");
       error.code = "PAYLOAD_TOO_LARGE";
       throw error;
     }
+    chunks.push(buffer);
   }
-  return JSON.parse(body || "{}");
+  try {
+    return JSON.parse(Buffer.concat(chunks, size).toString("utf8") || "{}");
+  } catch {
+    const error = new Error("请求 JSON 格式无效");
+    error.code = "INVALID_JSON";
+    throw error;
+  }
 }
 
 function clientAddress(request, trustProxy) {
   if (trustProxy) {
     const forwarded = request.headers["x-forwarded-for"];
     if (typeof forwarded === "string" && forwarded.trim()) {
-      return forwarded.split(",")[0].trim();
+      const addresses = forwarded.split(",").map((value) => value.trim()).filter(Boolean);
+      const nearestForwardedAddress = addresses.at(-1);
+      if (nearestForwardedAddress && isIP(nearestForwardedAddress)) return nearestForwardedAddress;
     }
   }
   return request.socket.remoteAddress || "unknown";
 }
 
 function parseAllowedOrigins(value) {
-  return new Set(String(value || "").split(",").map((item) => item.trim().replace(/\/$/, "")).filter(Boolean));
+  const origins = new Set();
+  for (const item of String(value || "").split(",").map((entry) => entry.trim()).filter(Boolean)) {
+    let parsed;
+    try { parsed = new URL(item); }
+    catch { throw new Error(`ALLOWED_ORIGINS 包含无效 Origin: ${item}`); }
+    if (!/^https?:$/.test(parsed.protocol) || parsed.origin !== item.replace(/\/$/, "") || parsed.username || parsed.password) {
+      throw new Error(`ALLOWED_ORIGINS 必须是精确的 HTTP(S) Origin: ${item}`);
+    }
+    origins.add(parsed.origin);
+  }
+  return origins;
 }
 
-function corsHeaders(request, allowedOrigins) {
+function requestOrigin(request, trustProxy) {
+  const forwardedProtocol = trustProxy ? String(request.headers["x-forwarded-proto"] || "").split(",").at(-1)?.trim() : "";
+  const protocol = ["http", "https"].includes(forwardedProtocol) ? forwardedProtocol : request.socket.encrypted ? "https" : "http";
+  const host = String(request.headers.host || "").trim();
+  if (!host) return "";
+  try { return new URL(`${protocol}://${host}`).origin; }
+  catch { return ""; }
+}
+
+function corsHeaders(request, allowedOrigins, trustProxy) {
   const origin = String(request.headers.origin || "").replace(/\/$/, "");
   if (!origin) return {};
   try {
-    if (new URL(origin).host === request.headers.host) return {};
+    if (new URL(origin).origin === requestOrigin(request, trustProxy)) return {};
   } catch {
     return null;
   }
@@ -84,20 +124,62 @@ function tokensEqual(left, right) {
   return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
 }
 
+function acceptsJson(request) {
+  const mediaType = String(request.headers["content-type"] || "").split(";", 1)[0].trim().toLowerCase();
+  return mediaType === "application/json" || mediaType.endsWith("+json");
+}
+
+function isLoopbackAddress(value) {
+  const address = String(value || "").toLowerCase();
+  return address === "::1" || address.startsWith("127.") || address.startsWith("::ffff:127.");
+}
+
+function isLoopbackHost(value) {
+  try {
+    const hostname = new URL(`http://${String(value || "")}`).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    return hostname === "localhost" || hostname === "::1" || hostname.startsWith("127.");
+  } catch {
+    return false;
+  }
+}
+
+function allowsLocalUnauthenticatedAgent(request, enabled, trustProxy) {
+  return enabled && !trustProxy && isLoopbackAddress(request.socket.localAddress) && isLoopbackHost(request.headers.host);
+}
+
+function pruneRateBuckets(buckets, now, windowMs, maxBuckets) {
+  for (const [key, bucket] of buckets) {
+    if (now - bucket.startedAt >= windowMs) buckets.delete(key);
+  }
+  while (buckets.size >= maxBuckets) buckets.delete(buckets.keys().next().value);
+}
+
+function boundedNumber(value, fallback, { min, max }) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(Math.floor(parsed), max));
+}
+
 export function createServer(options = {}) {
-  const rateLimitMax = Number(options.rateLimitMax ?? process.env.RATE_LIMIT_MAX ?? 30);
-  const rateLimitWindowMs = Number(options.rateLimitWindowMs ?? process.env.RATE_LIMIT_WINDOW_MS ?? 60_000);
-  const trustProxy = options.trustProxy ?? process.env.TRUST_PROXY === "1";
-  const providerMode = options.providerMode ?? process.env.AGENT_PROVIDER_MODE ?? "mock";
-  const accessToken = String(options.accessToken ?? process.env.AGENT_ACCESS_TOKEN ?? "");
-  const allowUnauthenticatedAgent = options.allowUnauthenticatedAgent ?? process.env.ALLOW_UNAUTHENTICATED_AGENT === "1";
-  const allowedOrigins = parseAllowedOrigins(options.allowedOrigins ?? process.env.ALLOWED_ORIGINS);
+  const agentEnv = options.agentEnv ?? process.env;
+  const rateLimitMax = boundedNumber(options.rateLimitMax ?? agentEnv.RATE_LIMIT_MAX, 30, { min: 1, max: 10_000 });
+  const rateLimitWindowMs = boundedNumber(options.rateLimitWindowMs ?? agentEnv.RATE_LIMIT_WINDOW_MS, 60_000, { min: 1_000, max: 3_600_000 });
+  const rateLimitMaxBuckets = boundedNumber(options.rateLimitMaxBuckets ?? agentEnv.RATE_LIMIT_MAX_BUCKETS, 5_000, { min: 100, max: 100_000 });
+  const globalRateLimitMax = boundedNumber(options.globalRateLimitMax ?? agentEnv.GLOBAL_RATE_LIMIT_MAX, Math.max(rateLimitMax * 20, 200), { min: rateLimitMax, max: 1_000_000 });
+  const trustProxy = options.trustProxy ?? agentEnv.TRUST_PROXY === "1";
+  const providerMode = options.providerMode ?? agentEnv.AGENT_PROVIDER_MODE ?? "mock";
+  const accessToken = String(options.accessToken ?? agentEnv.AGENT_ACCESS_TOKEN ?? "");
+  const allowUnauthenticatedAgent = options.allowUnauthenticatedAgent ?? agentEnv.ALLOW_UNAUTHENTICATED_AGENT === "1";
+  const exposeHealthDetails = options.exposeHealthDetails ?? agentEnv.EXPOSE_HEALTH_DETAILS === "1";
+  const allowedOrigins = parseAllowedOrigins(options.allowedOrigins ?? agentEnv.ALLOWED_ORIGINS);
+  const operationEnv = options.providerMode === undefined ? agentEnv : { ...agentEnv, AGENT_PROVIDER_MODE: providerMode };
   const requestsByAddress = new Map();
+  let globalBucket = { startedAt: 0, count: 0 };
 
   return http.createServer(async (request, response) => {
     const url = new URL(request.url || "/", "http://localhost");
     const apiRequest = url.pathname.startsWith("/api/");
-    const cors = apiRequest ? corsHeaders(request, allowedOrigins) : {};
+    const cors = apiRequest ? corsHeaders(request, allowedOrigins, trustProxy) : {};
     if (apiRequest && cors === null) return json(response, 403, { error: "请求来源不允许" });
 
     if (request.method === "OPTIONS" && apiRequest) {
@@ -106,22 +188,26 @@ export function createServer(options = {}) {
     }
 
     if (request.method === "GET" && url.pathname === "/api/health") {
-      return json(response, 200, {
-        ok: true,
-        providerMode,
-        accessProtected: Boolean(accessToken),
-      }, cors);
+      return json(response, 200, exposeHealthDetails ? { ok: true, providerMode, accessProtected: accessToken.length >= 32 } : { ok: true }, cors);
     }
 
     const operation = url.pathname.match(/^\/api\/agent\/(interview|directions|draft|rewrite|audit)$/)?.[1];
     if (request.method === "POST" && operation) {
       const now = Date.now();
+      if (!globalBucket.startedAt || now - globalBucket.startedAt >= rateLimitWindowMs) globalBucket = { startedAt: now, count: 0 };
+      globalBucket.count += 1;
+      if (Number.isFinite(globalRateLimitMax) && globalRateLimitMax > 0 && globalBucket.count > globalRateLimitMax) {
+        const retryAfter = Math.max(1, Math.ceil((rateLimitWindowMs - (now - globalBucket.startedAt)) / 1000));
+        return json(response, 429, { error: "服务请求过于频繁，请稍后重试" }, { ...cors, "retry-after": String(retryAfter) });
+      }
       const address = clientAddress(request, trustProxy);
       const current = requestsByAddress.get(address);
       const bucket = !current || now - current.startedAt >= rateLimitWindowMs
         ? { startedAt: now, count: 0 }
         : current;
       bucket.count += 1;
+      if (!current && requestsByAddress.size >= rateLimitMaxBuckets) pruneRateBuckets(requestsByAddress, now, rateLimitWindowMs, rateLimitMaxBuckets);
+      requestsByAddress.delete(address);
       requestsByAddress.set(address, bucket);
 
       if (Number.isFinite(rateLimitMax) && rateLimitMax > 0 && bucket.count > rateLimitMax) {
@@ -129,19 +215,24 @@ export function createServer(options = {}) {
         return json(response, 429, { error: "请求过于频繁，请稍后重试" }, { ...cors, "retry-after": String(retryAfter) });
       }
 
-      if (providerMode !== "mock" && !accessToken && !allowUnauthenticatedAgent) {
+      const localUnauthenticatedAgent = allowsLocalUnauthenticatedAgent(request, allowUnauthenticatedAgent, trustProxy);
+      if (providerMode !== "mock" && !accessToken && !localUnauthenticatedAgent) {
         return json(response, 503, { error: "真实 AI 服务尚未完成访问保护配置" }, cors);
+      }
+      if (providerMode !== "mock" && accessToken && accessToken.length < 32) {
+        return json(response, 503, { error: "真实 AI 服务访问码强度不足" }, cors);
       }
       if (accessToken && !tokensEqual(bearerToken(request), accessToken)) {
         return json(response, 401, { error: "访问码无效" }, { ...cors, "www-authenticate": "Bearer" });
       }
+      if (!acceptsJson(request)) return json(response, 415, { error: "仅支持 application/json 请求" }, cors);
 
       try {
-        return json(response, 200, await runAgentOperation(operation, await readJson(request)), cors);
+        return json(response, 200, await runAgentOperation(operation, await readJson(request), operationEnv), cors);
       } catch (error) {
         const requestId = randomUUID();
         const status = error?.code === "PAYLOAD_TOO_LARGE" ? 413
-          : error?.code === "INVALID_INPUT" ? 400
+          : ["INVALID_INPUT", "INVALID_JSON"].includes(error?.code) ? 400
             : error?.code === "CONFIG_ERROR" ? 503
               : error?.code === "PROVIDER_ERROR" ? 502
                 : 500;
@@ -164,7 +255,7 @@ export function createServer(options = {}) {
           "x-content-type-options": "nosniff",
           "referrer-policy": "no-referrer",
           "permissions-policy": "camera=(), microphone=(), geolocation=()",
-          "content-security-policy": "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' https://api.deepseek.com",
+          "content-security-policy": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' https://api.deepseek.com",
         });
         return response.end(body);
       } catch {

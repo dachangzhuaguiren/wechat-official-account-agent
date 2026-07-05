@@ -22,6 +22,12 @@ for (const [source, target] of [
 }
 
 const apiBaseUrl = String(process.env.AGENT_API_BASE_URL || "").replace(/\/$/, "");
+if (apiBaseUrl) {
+  let parsedApiBaseUrl;
+  try { parsedApiBaseUrl = new URL(apiBaseUrl); }
+  catch { throw new Error("AGENT_API_BASE_URL 必须是有效的 HTTPS URL"); }
+  if (parsedApiBaseUrl.protocol !== "https:") throw new Error("GitHub Pages 后端地址必须使用 HTTPS");
+}
 await writeFile(
   path.join(outputDir, "config.js"),
   `window.AGENT_CONFIG = Object.freeze(${JSON.stringify({ apiBaseUrl })});\n`,
@@ -31,6 +37,11 @@ await writeFile(
 const html = await readFile(path.join(outputDir, "index.html"), "utf8");
 if (!html.includes('./app.js') || !html.includes('./config.js') || !html.includes('./styles.css')) {
   throw new Error("GitHub Pages 产物必须使用相对资源路径");
+}
+
+for (const file of ["index.html", "app.js", "agent-core.js", "config.js"]) {
+  const content = await readFile(path.join(outputDir, file), "utf8");
+  if (/sk-[A-Za-z0-9_-]{20,}/.test(content)) throw new Error(`GitHub Pages 产物疑似包含 API Key: ${file}`);
 }
 
 await writeFile(path.join(outputDir, ".nojekyll"), "", "utf8");

@@ -48,7 +48,7 @@ AGENT_ACCESS_TOKEN=另设的随机访问码
 
 ## GitHub Pages 部署
 
-现有 GitHub Pages 地址会直接连接 DeepSeek V4。第一次使用真实 AI 时，网页会要求输入 DeepSeek API Key；Key 仅保存在当前标签页的 `sessionStorage`，关闭标签页后自动清除，不会写入 GitHub 或 IndexedDB。详见 [DeepSeek V4 部署说明](docs/deploy-deepseek-v4.md)。
+现有 GitHub Pages 地址会直接连接 DeepSeek V4。第一次使用真实 AI 时，网页会要求输入 DeepSeek API Key；Key 仅保存在当前页面的 JavaScript 内存中，刷新或关闭页面后自动清除，不会写入 Web Storage、GitHub 或 IndexedDB。详见 [DeepSeek V4 部署说明](docs/deploy-deepseek-v4.md)。
 
 推送到 GitHub 仓库的 `main` 分支后，`Deploy GitHub Pages` 工作流会自动测试、构建并发布网站。项目站点默认地址为：
 
@@ -63,3 +63,5 @@ GitHub Pages 是静态托管：未配置 `AGENT_API_BASE_URL` 时，由浏览器
 - 草稿和品牌信息保存在当前浏览器的 IndexedDB 中。
 - 服务端不保存文章内容或用户账户。
 - 公网 API 默认按来源地址限制为每分钟 30 次请求。
+
+后端 API 的身份、权限、信任边界、已修复问题和部署检查见 [后端安全边界表](docs/BACKEND_SECURITY_BOUNDARIES.md)。

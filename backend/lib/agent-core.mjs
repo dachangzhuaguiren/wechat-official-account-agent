@@ -139,12 +139,43 @@ export function sanitizeArticleHtml(value) {
 }
 
 function validateResult(operation, value) {
-  if (!value || typeof value !== "object") throw new Error("模型返回结果不是对象");
-  if (operation === "interview" && !["question", "brief"].includes(value.status)) throw new Error("访谈结果缺少有效状态");
-  if (operation === "directions" && (!Array.isArray(value.directions) || value.directions.length !== 3)) throw new Error("必须返回三组内容方向");
-  if (operation === "draft" && typeof value.articleHtml !== "string") throw new Error("正文格式无效");
-  if (operation === "rewrite" && typeof value.replacement !== "string") throw new Error("改写结果无效");
-  if (operation === "audit" && !Array.isArray(value.issues)) throw new Error("审校结果无效");
+  assertObject(value, "模型结果");
+  if (operation === "interview") {
+    assertAllowedKeys(value, ["status", "question", "brief"], "访谈结果");
+    if (value.status === "question") {
+      assertObject(value.question, "访谈问题");
+      assertAllowedKeys(value.question, ["id", "text", "hint"], "访谈问题");
+      assertIdentifier(value.question.id, "问题编号");
+      assertString(value.question.text, "访谈问题", { min: 1, max: 1000 });
+      assertString(value.question.hint, "回答提示", { min: 0, max: 1000 });
+    } else if (value.status === "brief") validateBrief(value.brief, "营销简报");
+    else throw agentError("INVALID_MODEL_RESULT", "访谈结果缺少有效状态");
+  }
+  if (operation === "directions") {
+    assertAllowedKeys(value, ["directions"], "内容方向结果");
+    if (!Array.isArray(value.directions) || value.directions.length !== 3) throw agentError("INVALID_MODEL_RESULT", "必须返回三组内容方向");
+    value.directions.forEach((direction, index) => validateDirection(direction, `内容方向 ${index + 1}`));
+  }
+  if (operation === "draft") {
+    assertAllowedKeys(value, ["articleHtml"], "正文结果");
+    assertString(value.articleHtml, "正文 HTML", { min: 1, max: 200_000 });
+  }
+  if (operation === "rewrite") {
+    assertAllowedKeys(value, ["replacement"], "改写结果");
+    assertString(value.replacement, "改写结果", { min: 1, max: 20_000 });
+  }
+  if (operation === "audit") {
+    assertAllowedKeys(value, ["issues"], "审校结果");
+    if (!Array.isArray(value.issues) || value.issues.length > 50) throw agentError("INVALID_MODEL_RESULT", "审校问题数量无效");
+    value.issues.forEach((issue, index) => {
+      assertObject(issue, `审校问题 ${index + 1}`);
+      assertAllowedKeys(issue, ["id", "severity", "message", "excerpt"], `审校问题 ${index + 1}`);
+      assertIdentifier(issue.id, "审校问题编号");
+      if (!["blocking", "warning"].includes(issue.severity)) throw agentError("INVALID_MODEL_RESULT", "审校严重级别无效");
+      assertString(issue.message, "审校问题说明", { min: 1, max: 2000 });
+      if (issue.excerpt !== undefined) assertString(issue.excerpt, "相关原文", { min: 0, max: 4000 });
+    });
+  }
   return value;
 }
 
@@ -160,6 +191,8 @@ function agentError(code, message) {
 
 function assertObject(value, field) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw agentError("INVALID_INPUT", `${field} 格式无效`);
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw agentError("INVALID_INPUT", `${field} 必须是普通对象`);
 }
 
 function assertString(value, field, { min = 0, max }) {
@@ -168,9 +201,69 @@ function assertString(value, field, { min = 0, max }) {
   }
 }
 
+function assertAllowedKeys(value, allowedKeys, field) {
+  const allowed = new Set(allowedKeys);
+  const unexpected = Object.keys(value).filter((key) => !allowed.has(key));
+  if (unexpected.length) throw agentError("INVALID_INPUT", `${field} 包含不允许的字段`);
+}
+
+function assertIdentifier(value, field) {
+  assertString(value, field, { min: 1, max: 80 });
+  if (!/^[a-z0-9][a-z0-9_-]*$/i.test(value)) throw agentError("INVALID_INPUT", `${field} 格式无效`);
+}
+
+function assertStringArray(value, field, { min = 0, max = 20, itemMax = 2000 } = {}) {
+  if (!Array.isArray(value) || value.length < min || value.length > max) throw agentError("INVALID_INPUT", `${field} 数量无效`);
+  value.forEach((item, index) => assertString(item, `${field} ${index + 1}`, { min: 1, max: itemMax }));
+}
+
+function validateBrand(brand) {
+  assertObject(brand, "品牌档案");
+  const stringFields = ["companyName", "summary", "targetAudience", "tone", "keyPoints", "forbiddenTerms", "defaultCta"];
+  assertAllowedKeys(brand, [...stringFields, "primaryColor", "accentColor"], "品牌档案");
+  for (const field of stringFields) {
+    if (brand[field] !== undefined) assertString(brand[field], `品牌档案 ${field}`, { min: 0, max: 4000 });
+  }
+  for (const field of ["primaryColor", "accentColor"]) {
+    if (brand[field] !== undefined && !/^#[0-9a-f]{6}$/i.test(brand[field])) throw agentError("INVALID_INPUT", `品牌档案 ${field} 格式无效`);
+  }
+}
+
+function validateBrief(brief, field = "营销简报") {
+  assertObject(brief, field);
+  assertAllowedKeys(brief, ["campaignType", "subject", "audience", "objective", "keyMessage", "proofPoints", "cta", "eventDetails", "restrictions", "missingFacts"], field);
+  if (!["product", "event"].includes(brief.campaignType)) throw agentError("INVALID_INPUT", `${field} 宣传类型无效`);
+  for (const name of ["subject", "audience", "objective", "keyMessage", "cta"]) assertString(brief[name], `${field} ${name}`, { min: 1, max: 4000 });
+  assertString(brief.eventDetails, `${field} eventDetails`, { min: 1, max: 4000 });
+  assertStringArray(brief.proofPoints, `${field} proofPoints`, { max: 20 });
+  assertStringArray(brief.restrictions, `${field} restrictions`, { max: 20 });
+  assertStringArray(brief.missingFacts, `${field} missingFacts`, { max: 20 });
+}
+
+function validateDirection(direction, field = "内容方向") {
+  assertObject(direction, field);
+  assertAllowedKeys(direction, ["id", "title", "angle", "outline"], field);
+  assertIdentifier(direction.id, `${field} 编号`);
+  assertString(direction.title, `${field} 标题`, { min: 1, max: 500 });
+  assertString(direction.angle, `${field} 角度`, { min: 1, max: 500 });
+  assertStringArray(direction.outline, `${field} 提纲`, { min: 1, max: 10, itemMax: 1000 });
+}
+
+function validateAssets(assets) {
+  if (!Array.isArray(assets) || assets.length > 20) throw agentError("INVALID_INPUT", "图片素材数量无效");
+  assets.forEach((asset, index) => {
+    assertObject(asset, `图片素材 ${index + 1}`);
+    assertAllowedKeys(asset, ["name", "description", "mimeType"], `图片素材 ${index + 1}`);
+    assertString(asset.name, "图片文件名", { min: 1, max: 255 });
+    assertString(asset.description, "图片描述", { min: 0, max: 2000 });
+    if (asset.mimeType !== undefined && !/^image\/[a-z0-9.+-]{1,40}$/i.test(asset.mimeType)) throw agentError("INVALID_INPUT", "图片 MIME 类型无效");
+  });
+}
+
 export function validateOperationPayload(operation, payload) {
   assertObject(payload, "请求内容");
   if (operation === "interview") {
+    assertAllowedKeys(payload, ["campaignType", "idea", "answers", "brand"], "访谈请求");
     if (!["product", "event"].includes(payload.campaignType)) throw agentError("INVALID_INPUT", "宣传类型无效");
     assertString(payload.idea, "粗浅想法", { min: 1, max: 4000 });
     if (!Array.isArray(payload.answers) || payload.answers.length > 8) throw agentError("INVALID_INPUT", "访谈回答格式无效");
@@ -180,20 +273,28 @@ export function validateOperationPayload(operation, payload) {
       assertString(answer.answer, "访谈回答", { min: 1, max: 4000 });
     }
   }
-  if (operation === "directions") assertObject(payload.brief, "营销简报");
+  if (operation === "directions") {
+    assertAllowedKeys(payload, ["brief", "brand"], "内容方向请求");
+    validateBrief(payload.brief);
+  }
   if (operation === "draft") {
-    assertObject(payload.brief, "营销简报");
-    assertObject(payload.direction, "内容方向");
-    if (payload.assets !== undefined && (!Array.isArray(payload.assets) || payload.assets.length > 20)) {
-      throw agentError("INVALID_INPUT", "图片素材数量无效");
-    }
+    assertAllowedKeys(payload, ["brief", "direction", "brand", "assets"], "正文请求");
+    validateBrief(payload.brief);
+    validateDirection(payload.direction);
+    if (payload.assets !== undefined) validateAssets(payload.assets);
   }
   if (operation === "rewrite") {
+    assertAllowedKeys(payload, ["text", "instruction", "brand", "brief"], "改写请求");
     assertString(payload.text, "待改写文本", { min: 1, max: 12000 });
     assertString(payload.instruction, "改写要求", { min: 1, max: 1000 });
+    if (payload.brief !== undefined) validateBrief(payload.brief);
   }
-  if (operation === "audit") assertString(payload.articleText, "文章正文", { min: 1, max: 50000 });
-  if (payload.brand !== undefined) assertObject(payload.brand, "品牌档案");
+  if (operation === "audit") {
+    assertAllowedKeys(payload, ["articleText", "brief", "brand"], "审校请求");
+    assertString(payload.articleText, "文章正文", { min: 1, max: 50000 });
+    validateBrief(payload.brief);
+  }
+  if (payload.brand !== undefined) validateBrand(payload.brand);
   return payload;
 }
 
@@ -202,13 +303,67 @@ function modelForOperation(operation, env) {
   return env.AGENT_MODEL;
 }
 
+const DEFAULT_MAX_OUTPUT_TOKENS = {
+  interview: 2000,
+  directions: 3000,
+  draft: 12000,
+  rewrite: 3000,
+  audit: 5000,
+};
+
+function maxOutputTokens(operation, env) {
+  const configured = Number(env.AGENT_MAX_OUTPUT_TOKENS);
+  if (Number.isFinite(configured) && configured > 0) return Math.min(Math.floor(configured), 20_000);
+  return DEFAULT_MAX_OUTPUT_TOKENS[operation];
+}
+
+async function readLimitedResponseText(response, maxBytes = 2_000_000) {
+  const declaredLength = Number(response.headers.get("content-length") || 0);
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) throw agentError("PROVIDER_ERROR", "模型服务响应过大");
+  if (!response.body?.getReader) {
+    const text = await response.text();
+    if (new TextEncoder().encode(text).length > maxBytes) throw agentError("PROVIDER_ERROR", "模型服务响应过大");
+    return text;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw agentError("PROVIDER_ERROR", "模型服务响应过大");
+    }
+    chunks.push(value);
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(merged);
+}
+
 async function providerCall(messages, env, model, operation) {
   const base = String(env.AGENT_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
   if (!env.AGENT_API_KEY || !model) throw agentError("CONFIG_ERROR", "模型服务尚未完成配置");
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), Math.min(Number(env.AGENT_TIMEOUT_MS || 45000), 90000));
+  let providerUrl;
   try {
-    const requestBody = { model, temperature: 0.45, response_format: { type: "json_object" }, messages };
+    const parsedBase = new URL(base);
+    if (!/^https?:$/.test(parsedBase.protocol)) throw new Error("unsupported protocol");
+    providerUrl = `${parsedBase.href.replace(/\/$/, "")}/chat/completions`;
+  } catch {
+    throw agentError("CONFIG_ERROR", "模型服务地址无效");
+  }
+  const controller = new AbortController();
+  const configuredTimeout = Number(env.AGENT_TIMEOUT_MS || 45000);
+  const timeoutMs = Number.isFinite(configuredTimeout) ? Math.max(1000, Math.min(configuredTimeout, 90000)) : 45000;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const requestBody = { model, temperature: 0.45, max_tokens: maxOutputTokens(operation, env), response_format: { type: "json_object" }, messages };
     if (env.AGENT_THINKING_MODE === "operation-based") {
       const thinkingEnabled = ["draft", "audit"].includes(operation);
       requestBody.thinking = { type: thinkingEnabled ? "enabled" : "disabled" };
@@ -217,8 +372,8 @@ async function providerCall(messages, env, model, operation) {
         requestBody.reasoning_effort = "high";
       }
     }
-    const response = await fetch(`${base}/chat/completions`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${env.AGENT_API_KEY}` }, body: JSON.stringify(requestBody), signal: controller.signal });
-    const body = await response.text();
+    const response = await fetch(providerUrl, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${env.AGENT_API_KEY}` }, body: JSON.stringify(requestBody), signal: controller.signal });
+    const body = await readLimitedResponseText(response);
     if (!response.ok) throw agentError("PROVIDER_ERROR", `模型服务返回 ${response.status}`);
     let parsed;
     try { parsed = JSON.parse(body); }
