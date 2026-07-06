@@ -1,12 +1,9 @@
 import { runStaticAgentOperation } from "./mock-agent.js";
 import { runAgentOperation } from "./agent-core.js";
+import { DEFAULT_BRAND, createEmptyWorkspace, normalizeWorkspaceBackup } from "./workspace-schema.js";
+import { decryptBackup, encryptBackup, isEncryptedBackup } from "./backup-crypto.js";
 
-const DEFAULT_BRAND = {
-  companyName: "", summary: "", targetAudience: "", tone: "专业、清晰、有温度",
-  keyPoints: "", forbiddenTerms: "最、第一、绝对、百分百", defaultCta: "了解详情或预约体验",
-  primaryColor: "#0f766e", accentColor: "#2563eb",
-};
-const EMPTY_WORKSPACE = { schemaVersion: 1, brand: DEFAULT_BRAND, projects: [], activeProjectId: undefined };
+const EMPTY_WORKSPACE = createEmptyWorkspace();
 const STATUS_LABELS = { idea: "想法", interview: "访谈", brief: "简报", directions: "提纲", draft: "草稿" };
 const STEPS = ["想法", "营销简报", "标题与提纲", "正文"];
 const DB_NAME = "wechat-content-agent";
@@ -17,6 +14,7 @@ let selectedText = "";
 let rewritePreview;
 let saveTimer;
 let deepSeekApiKey = "";
+let remoteAccessToken = "";
 const configuredApiBaseUrl = String(window.AGENT_CONFIG?.apiBaseUrl || "").replace(/\/$/, "");
 const remoteAgentConfigured = Boolean(configuredApiBaseUrl);
 const directDeepSeekMode = location.hostname.endsWith(".github.io") && !remoteAgentConfigured;
@@ -56,9 +54,21 @@ async function loadWorkspace() {
   const db = await openDatabase();
   return new Promise((resolve, reject) => {
     const request = db.transaction("workspace", "readonly").objectStore("workspace").get("current");
-    request.onsuccess = () => resolve(request.result?.schemaVersion === 1 ? request.result : structuredClone(EMPTY_WORKSPACE));
+    request.onsuccess = () => {
+      if (!request.result) return resolve(createEmptyWorkspace());
+      try { resolve(sanitizeWorkspaceContent(normalizeWorkspaceBackup(request.result))); }
+      catch (error) { reject(error); }
+    };
     request.onerror = () => reject(request.error);
   });
+}
+
+function sanitizeWorkspaceContent(value) {
+  value.projects.forEach((project) => {
+    project.articleHtml = sanitizeArticleClient(project.articleHtml);
+    project.versions = project.versions.map((version) => ({ ...version, html: sanitizeArticleClient(version.html) }));
+  });
+  return value;
 }
 
 async function persistWorkspace() {
@@ -101,13 +111,10 @@ async function api(operation, payload) {
       throw error;
     }
   }
-  let accessToken = "";
   if (remoteAgentConfigured) {
-    accessToken = sessionStorage.getItem("agent-access-token") || "";
-    if (!accessToken) {
-      accessToken = String(window.prompt("请输入写作 Agent 访问码。它不是 DeepSeek API Key。") || "").trim();
-      if (!accessToken) throw new Error("需要访问码才能使用真实 AI");
-      sessionStorage.setItem("agent-access-token", accessToken);
+    if (!remoteAccessToken) {
+      remoteAccessToken = String(window.prompt("请输入写作 Agent 访问码。它不是 DeepSeek API Key。") || "").trim();
+      if (!remoteAccessToken) throw new Error("需要访问码才能使用真实 AI");
     }
   }
   try {
@@ -115,7 +122,7 @@ async function api(operation, payload) {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+        ...(remoteAccessToken ? { authorization: `Bearer ${remoteAccessToken}` } : {}),
       },
       body: JSON.stringify(payload),
     });
@@ -126,7 +133,7 @@ async function api(operation, payload) {
     }
     const result = isJson ? await response.json() : { error: "服务返回了无法解析的响应" };
     if (remoteAgentConfigured && response.status === 401) {
-      sessionStorage.removeItem("agent-access-token");
+      remoteAccessToken = "";
       throw new Error("访问码不正确，请重新操作并输入正确的访问码");
     }
     if (!response.ok) throw new Error(result.error || "Agent 请求失败");
@@ -498,14 +505,51 @@ function showPreview() {
   openModal("公众号样式预览", `<div class="wechat-preview">${buildWechatHtml(project.articleHtml)}</div>`, undefined, true);
 }
 
-function exportBackup() {
-  const blob = new Blob([JSON.stringify(workspace, null, 2)], { type: "application/json" }); const link = document.createElement("a");
-  link.href = URL.createObjectURL(blob); link.download = `wechat-agent-backup-${new Date().toISOString().slice(0, 10)}.json`; link.click(); URL.revokeObjectURL(link.href); showToast("本地备份已导出");
+function downloadBackup(value, filename) {
+  const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob); link.download = filename; link.click(); URL.revokeObjectURL(link.href);
+}
+
+async function exportBackup() {
+  try {
+    const date = new Date().toISOString().slice(0, 10);
+    if (confirm("备份中可能包含未发布文章和图片。是否使用密码加密？")) {
+      const passphrase = String(prompt("设置备份密码（至少 10 个字符；丢失后无法恢复）") || "");
+      if (!passphrase) return;
+      downloadBackup(await encryptBackup(workspace, passphrase), `wechat-agent-backup-${date}.encrypted.json`);
+      return showToast("加密备份已导出");
+    }
+    if (!confirm("明文备份可被任何取得文件的人读取。仍要导出吗？")) return;
+    downloadBackup(workspace, `wechat-agent-backup-${date}.json`);
+    showToast("明文备份已导出");
+  } catch (error) { showToast(error instanceof Error ? error.message : "导出失败", "error"); }
 }
 
 async function importBackup(file) {
-  try { if (file.size > 25 * 1024 * 1024) throw new Error("备份文件不能超过 25MB"); const parsed = JSON.parse(await file.text()); if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.projects) || !parsed.brand) throw new Error("备份文件格式不正确"); parsed.projects.forEach((project) => { project.articleHtml = sanitizeArticleClient(project.articleHtml); project.versions = Array.isArray(project.versions) ? project.versions.slice(0, 10).map((version) => ({ ...version, html: sanitizeArticleClient(version.html) })) : []; }); workspace = parsed; await persistWorkspace(); renderAll(); showToast("备份已恢复"); }
+  try {
+    if (file.size > 25 * 1024 * 1024) throw new Error("备份文件不能超过 25MB");
+    let parsed = JSON.parse(await file.text());
+    if (isEncryptedBackup(parsed)) {
+      const passphrase = String(prompt("请输入备份密码") || "");
+      if (!passphrase) return;
+      parsed = await decryptBackup(parsed, passphrase);
+    }
+    workspace = sanitizeWorkspaceContent(normalizeWorkspaceBackup(parsed));
+    await persistWorkspace(); renderAll(); showToast("备份已验证并恢复");
+  }
   catch (error) { showToast(error instanceof Error ? error.message : "导入失败", "error"); }
+}
+
+async function clearLocalData() {
+  if (!confirm("将删除此浏览器中的全部项目、图片、品牌档案和临时访问码。此操作无法撤销。")) return;
+  workspace = createEmptyWorkspace(); deepSeekApiKey = ""; remoteAccessToken = ""; sessionStorage.removeItem("agent-access-token");
+  const db = await openDatabase();
+  await new Promise((resolve, reject) => {
+    const request = db.transaction("workspace", "readwrite").objectStore("workspace").delete("current");
+    request.onsuccess = resolve; request.onerror = () => reject(request.error);
+  });
+  renderAll(); showToast("本地数据已清除");
 }
 
 function openSidebar() { $("#sidebar-wrap").classList.add("open"); $("#sidebar-scrim").style.display = "block"; }
@@ -513,6 +557,11 @@ function closeSidebar() { $("#sidebar-wrap").classList.remove("open"); $("#sideb
 function renderAll() { renderSidebar(); renderAgent(); renderCanvas(); }
 
 async function init() {
+  sessionStorage.removeItem("agent-access-token");
+  if (embeddedMode) {
+    $("#loading").innerHTML = "<strong>为防止点击劫持，请在浏览器地址栏中直接打开本站。</strong>";
+    return;
+  }
   try { workspace = await loadWorkspace(); }
   catch { workspace = structuredClone(EMPTY_WORKSPACE); showToast("无法读取旧数据，已打开空白工作区", "error"); }
   $("#loading").hidden = true; $("#app").hidden = false; renderAll();
@@ -520,6 +569,7 @@ async function init() {
   $("#brand-settings").addEventListener("click", showBrandSettings);
   $("#export-backup").addEventListener("click", exportBackup);
   $("#import-backup").addEventListener("change", (event) => event.target.files?.[0] && importBackup(event.target.files[0]));
+  $("#clear-local-data").addEventListener("click", () => clearLocalData().catch(() => showToast("清除本地数据失败", "error")));
   $("#mobile-menu").addEventListener("click", () => $("#sidebar-wrap").classList.contains("open") ? closeSidebar() : openSidebar());
   $("#sidebar-scrim").addEventListener("click", closeSidebar);
   $$('[data-mobile-view]').forEach((button) => button.addEventListener("click", () => {

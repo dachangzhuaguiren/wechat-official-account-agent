@@ -13,6 +13,8 @@ await mkdir(path.join(outputDir, "vendor"), { recursive: true });
 for (const [source, target] of [
   ["frontend/public/index.html", "index.html"],
   ["frontend/public/app.js", "app.js"],
+  ["frontend/public/workspace-schema.js", "workspace-schema.js"],
+  ["frontend/public/backup-crypto.js", "backup-crypto.js"],
   ["backend/lib/agent-core.mjs", "agent-core.js"],
   ["frontend/public/mock-agent.js", "mock-agent.js"],
   ["frontend/styles/globals.css", "styles.css"],
@@ -39,7 +41,7 @@ if (!html.includes('./app.js') || !html.includes('./config.js') || !html.include
   throw new Error("GitHub Pages 产物必须使用相对资源路径");
 }
 
-for (const file of ["index.html", "app.js", "agent-core.js", "config.js"]) {
+for (const file of ["index.html", "app.js", "workspace-schema.js", "backup-crypto.js", "agent-core.js", "config.js"]) {
   const content = await readFile(path.join(outputDir, file), "utf8");
   if (/sk-[A-Za-z0-9_-]{20,}/.test(content)) throw new Error(`GitHub Pages 产物疑似包含 API Key: ${file}`);
 }

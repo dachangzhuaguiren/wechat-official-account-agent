@@ -1,5 +1,5 @@
 import http from "node:http";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { isIP } from "node:net";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -15,6 +15,8 @@ const staticFiles = new Map([
   ["/agent-core.js", ["backend/lib/agent-core.mjs", "text/javascript; charset=utf-8"]],
   ["/config.js", ["frontend/public/config.js", "text/javascript; charset=utf-8"]],
   ["/mock-agent.js", ["frontend/public/mock-agent.js", "text/javascript; charset=utf-8"]],
+  ["/workspace-schema.js", ["frontend/public/workspace-schema.js", "text/javascript; charset=utf-8"]],
+  ["/backup-crypto.js", ["frontend/public/backup-crypto.js", "text/javascript; charset=utf-8"]],
   ["/styles.css", ["frontend/styles/globals.css", "text/css; charset=utf-8"]],
   ["/vendor/phosphor-regular.woff2", ["frontend/public/vendor/phosphor-regular.woff2", "font/woff2"]],
 ]);
@@ -78,7 +80,8 @@ function parseAllowedOrigins(value) {
     let parsed;
     try { parsed = new URL(item); }
     catch { throw new Error(`ALLOWED_ORIGINS 包含无效 Origin: ${item}`); }
-    if (!/^https?:$/.test(parsed.protocol) || parsed.origin !== item.replace(/\/$/, "") || parsed.username || parsed.password) {
+    const insecureLoopback = parsed.protocol === "http:" && isLoopbackHostname(parsed.hostname);
+    if ((!insecureLoopback && parsed.protocol !== "https:") || parsed.origin !== item.replace(/\/$/, "") || parsed.username || parsed.password) {
       throw new Error(`ALLOWED_ORIGINS 必须是精确的 HTTP(S) Origin: ${item}`);
     }
     origins.add(parsed.origin);
@@ -134,10 +137,15 @@ function isLoopbackAddress(value) {
   return address === "::1" || address.startsWith("127.") || address.startsWith("::ffff:127.");
 }
 
+function isLoopbackHostname(value) {
+  const hostname = String(value || "").replace(/^\[|\]$/g, "").toLowerCase();
+  return hostname === "localhost" || hostname === "::1" || hostname.startsWith("127.");
+}
+
 function isLoopbackHost(value) {
   try {
     const hostname = new URL(`http://${String(value || "")}`).hostname.replace(/^\[|\]$/g, "").toLowerCase();
-    return hostname === "localhost" || hostname === "::1" || hostname.startsWith("127.");
+    return isLoopbackHostname(hostname);
   } catch {
     return false;
   }
@@ -160,12 +168,32 @@ function boundedNumber(value, fallback, { min, max }) {
   return Math.max(min, Math.min(Math.floor(parsed), max));
 }
 
+function consumeRateBucket(buckets, key, now, windowMs, max, maxBuckets) {
+  const current = buckets.get(key);
+  const bucket = !current || now - current.startedAt >= windowMs ? { startedAt: now, count: 0 } : current;
+  bucket.count += 1;
+  if (!current && buckets.size >= maxBuckets) pruneRateBuckets(buckets, now, windowMs, maxBuckets);
+  buckets.delete(key);
+  buckets.set(key, bucket);
+  return {
+    limited: bucket.count > max,
+    retryAfter: Math.max(1, Math.ceil((windowMs - (now - bucket.startedAt)) / 1000)),
+  };
+}
+
+function sourceIdentifier(address, auditLogKey) {
+  if (auditLogKey.length < 32) return undefined;
+  return createHmac("sha256", auditLogKey).update(String(address)).digest("hex").slice(0, 16);
+}
+
 export function createServer(options = {}) {
   const agentEnv = options.agentEnv ?? process.env;
   const rateLimitMax = boundedNumber(options.rateLimitMax ?? agentEnv.RATE_LIMIT_MAX, 30, { min: 1, max: 10_000 });
   const rateLimitWindowMs = boundedNumber(options.rateLimitWindowMs ?? agentEnv.RATE_LIMIT_WINDOW_MS, 60_000, { min: 1_000, max: 3_600_000 });
   const rateLimitMaxBuckets = boundedNumber(options.rateLimitMaxBuckets ?? agentEnv.RATE_LIMIT_MAX_BUCKETS, 5_000, { min: 100, max: 100_000 });
   const globalRateLimitMax = boundedNumber(options.globalRateLimitMax ?? agentEnv.GLOBAL_RATE_LIMIT_MAX, Math.max(rateLimitMax * 20, 200), { min: rateLimitMax, max: 1_000_000 });
+  const authRateLimitMax = boundedNumber(options.authRateLimitMax ?? agentEnv.AUTH_RATE_LIMIT_MAX, 10, { min: 1, max: 1_000 });
+  const authRateLimitWindowMs = boundedNumber(options.authRateLimitWindowMs ?? agentEnv.AUTH_RATE_LIMIT_WINDOW_MS, 60_000, { min: 1_000, max: 3_600_000 });
   const trustProxy = options.trustProxy ?? agentEnv.TRUST_PROXY === "1";
   const providerMode = options.providerMode ?? agentEnv.AGENT_PROVIDER_MODE ?? "mock";
   const accessToken = String(options.accessToken ?? agentEnv.AGENT_ACCESS_TOKEN ?? "");
@@ -174,13 +202,19 @@ export function createServer(options = {}) {
   const allowedOrigins = parseAllowedOrigins(options.allowedOrigins ?? agentEnv.ALLOWED_ORIGINS);
   const operationEnv = options.providerMode === undefined ? agentEnv : { ...agentEnv, AGENT_PROVIDER_MODE: providerMode };
   const requestsByAddress = new Map();
+  const authFailuresByAddress = new Map();
+  const auditLogKey = String(options.auditLogKey ?? agentEnv.AUDIT_LOG_KEY ?? "");
+  const securityLogger = options.securityLogger ?? ((event) => console.warn(JSON.stringify({ timestamp: new Date().toISOString(), ...event })));
   let globalBucket = { startedAt: 0, count: 0 };
 
-  return http.createServer(async (request, response) => {
+  const server = http.createServer(async (request, response) => {
     const url = new URL(request.url || "/", "http://localhost");
     const apiRequest = url.pathname.startsWith("/api/");
     const cors = apiRequest ? corsHeaders(request, allowedOrigins, trustProxy) : {};
-    if (apiRequest && cors === null) return json(response, 403, { error: "请求来源不允许" });
+    if (apiRequest && cors === null) {
+      securityLogger({ event: "origin_rejected", requestId: randomUUID(), status: 403 });
+      return json(response, 403, { error: "请求来源不允许" });
+    }
 
     if (request.method === "OPTIONS" && apiRequest) {
       response.writeHead(204, { ...cors, "cache-control": "no-store" });
@@ -194,26 +228,10 @@ export function createServer(options = {}) {
     const operation = url.pathname.match(/^\/api\/agent\/(interview|directions|draft|rewrite|audit)$/)?.[1];
     if (request.method === "POST" && operation) {
       const now = Date.now();
-      if (!globalBucket.startedAt || now - globalBucket.startedAt >= rateLimitWindowMs) globalBucket = { startedAt: now, count: 0 };
-      globalBucket.count += 1;
-      if (Number.isFinite(globalRateLimitMax) && globalRateLimitMax > 0 && globalBucket.count > globalRateLimitMax) {
-        const retryAfter = Math.max(1, Math.ceil((rateLimitWindowMs - (now - globalBucket.startedAt)) / 1000));
-        return json(response, 429, { error: "服务请求过于频繁，请稍后重试" }, { ...cors, "retry-after": String(retryAfter) });
-      }
+      const requestId = randomUUID();
       const address = clientAddress(request, trustProxy);
-      const current = requestsByAddress.get(address);
-      const bucket = !current || now - current.startedAt >= rateLimitWindowMs
-        ? { startedAt: now, count: 0 }
-        : current;
-      bucket.count += 1;
-      if (!current && requestsByAddress.size >= rateLimitMaxBuckets) pruneRateBuckets(requestsByAddress, now, rateLimitWindowMs, rateLimitMaxBuckets);
-      requestsByAddress.delete(address);
-      requestsByAddress.set(address, bucket);
-
-      if (Number.isFinite(rateLimitMax) && rateLimitMax > 0 && bucket.count > rateLimitMax) {
-        const retryAfter = Math.max(1, Math.ceil((rateLimitWindowMs - (now - bucket.startedAt)) / 1000));
-        return json(response, 429, { error: "请求过于频繁，请稍后重试" }, { ...cors, "retry-after": String(retryAfter) });
-      }
+      const sourceId = sourceIdentifier(address, auditLogKey);
+      const eventContext = { requestId, operation, ...(sourceId ? { sourceId } : {}) };
 
       const localUnauthenticatedAgent = allowsLocalUnauthenticatedAgent(request, allowUnauthenticatedAgent, trustProxy);
       if (providerMode !== "mock" && !accessToken && !localUnauthenticatedAgent) {
@@ -223,25 +241,41 @@ export function createServer(options = {}) {
         return json(response, 503, { error: "真实 AI 服务访问码强度不足" }, cors);
       }
       if (accessToken && !tokensEqual(bearerToken(request), accessToken)) {
-        return json(response, 401, { error: "访问码无效" }, { ...cors, "www-authenticate": "Bearer" });
+        const authLimit = consumeRateBucket(authFailuresByAddress, address, now, authRateLimitWindowMs, authRateLimitMax, rateLimitMaxBuckets);
+        const status = authLimit.limited ? 429 : 401;
+        securityLogger({ event: authLimit.limited ? "auth_rate_limited" : "authentication_failed", status, ...eventContext });
+        return json(response, status, { error: authLimit.limited ? "认证尝试过于频繁，请稍后重试" : "访问码无效", requestId }, { ...cors, ...(authLimit.limited ? { "retry-after": String(authLimit.retryAfter) } : { "www-authenticate": "Bearer" }) });
       }
+      authFailuresByAddress.delete(address);
       if (!acceptsJson(request)) return json(response, 415, { error: "仅支持 application/json 请求" }, cors);
 
+      if (!globalBucket.startedAt || now - globalBucket.startedAt >= rateLimitWindowMs) globalBucket = { startedAt: now, count: 0 };
+      globalBucket.count += 1;
+      if (globalBucket.count > globalRateLimitMax) {
+        const retryAfter = Math.max(1, Math.ceil((rateLimitWindowMs - (now - globalBucket.startedAt)) / 1000));
+        securityLogger({ event: "global_rate_limited", status: 429, ...eventContext });
+        return json(response, 429, { error: "服务请求过于频繁，请稍后重试", requestId }, { ...cors, "retry-after": String(retryAfter) });
+      }
+      const sourceLimit = consumeRateBucket(requestsByAddress, address, now, rateLimitWindowMs, rateLimitMax, rateLimitMaxBuckets);
+      if (sourceLimit.limited) {
+        securityLogger({ event: "source_rate_limited", status: 429, ...eventContext });
+        return json(response, 429, { error: "请求过于频繁，请稍后重试", requestId }, { ...cors, "retry-after": String(sourceLimit.retryAfter) });
+      }
+
       try {
-        return json(response, 200, await runAgentOperation(operation, await readJson(request), operationEnv), cors);
+        return json(response, 200, await runAgentOperation(operation, await readJson(request), operationEnv), { ...cors, "x-request-id": requestId });
       } catch (error) {
-        const requestId = randomUUID();
         const status = error?.code === "PAYLOAD_TOO_LARGE" ? 413
           : ["INVALID_INPUT", "INVALID_JSON"].includes(error?.code) ? 400
             : error?.code === "CONFIG_ERROR" ? 503
               : error?.code === "PROVIDER_ERROR" ? 502
                 : 500;
-        console.error("Agent request failed", { requestId, operation, code: error?.code || "UNEXPECTED", name: error?.name || "Error" });
+        securityLogger({ event: "agent_request_failed", status, code: error?.code || "UNEXPECTED", name: error?.name || "Error", ...eventContext });
         const errorMessage = status < 500 && error instanceof Error ? error.message
           : status === 502 ? "AI 服务暂时不可用，请稍后重试"
             : status === 503 ? "AI 服务尚未完成配置"
               : "Agent 处理失败";
-        return json(response, status, { error: errorMessage, requestId }, cors);
+        return json(response, status, { error: errorMessage, requestId }, { ...cors, "x-request-id": requestId });
       }
     }
 
@@ -265,6 +299,14 @@ export function createServer(options = {}) {
 
     return json(response, 404, { error: "页面不存在" });
   });
+  const requestTimeout = boundedNumber(options.requestTimeout ?? agentEnv.REQUEST_TIMEOUT_MS, 60_000, { min: 5_000, max: 300_000 });
+  server.requestTimeout = requestTimeout;
+  server.headersTimeout = Math.min(requestTimeout, boundedNumber(options.headersTimeout ?? agentEnv.HEADERS_TIMEOUT_MS, 15_000, { min: 5_000, max: 60_000 }));
+  server.keepAliveTimeout = boundedNumber(options.keepAliveTimeout ?? agentEnv.KEEP_ALIVE_TIMEOUT_MS, 5_000, { min: 1_000, max: 15_000 });
+  server.timeout = boundedNumber(options.socketTimeout ?? agentEnv.SOCKET_TIMEOUT_MS, 65_000, { min: 5_000, max: 300_000 });
+  server.maxHeadersCount = boundedNumber(options.maxHeadersCount ?? agentEnv.MAX_HEADERS_COUNT, 100, { min: 20, max: 1_000 });
+  server.maxRequestsPerSocket = boundedNumber(options.maxRequestsPerSocket ?? agentEnv.MAX_REQUESTS_PER_SOCKET, 100, { min: 1, max: 1_000 });
+  return server;
 }
 
 export async function loadLocalEnv() {

@@ -7,6 +7,8 @@ const required = [
   "backend/lib/agent-core.mjs",
   "frontend/public/index.html",
   "frontend/public/app.js",
+  "frontend/public/workspace-schema.js",
+  "frontend/public/backup-crypto.js",
   "frontend/public/mock-agent.js",
   "frontend/styles/globals.css",
   "frontend/public/vendor/phosphor-regular.woff2",
@@ -21,6 +23,8 @@ for (const file of [
   "backend/server.mjs",
   "backend/lib/agent-core.mjs",
   "frontend/public/app.js",
+  "frontend/public/workspace-schema.js",
+  "frontend/public/backup-crypto.js",
   "frontend/public/mock-agent.js",
 ]) {
   const result = spawnSync(

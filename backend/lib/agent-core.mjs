@@ -269,7 +269,9 @@ export function validateOperationPayload(operation, payload) {
     if (!Array.isArray(payload.answers) || payload.answers.length > 8) throw agentError("INVALID_INPUT", "访谈回答格式无效");
     for (const answer of payload.answers) {
       assertObject(answer, "访谈回答");
+      assertAllowedKeys(answer, ["questionId", "question", "answer"], "访谈回答");
       assertString(answer.questionId, "问题编号", { min: 1, max: 80 });
+      assertString(answer.question, "访谈问题", { min: 1, max: 1000 });
       assertString(answer.answer, "访谈回答", { min: 1, max: 4000 });
     }
   }
@@ -353,7 +355,11 @@ async function providerCall(messages, env, model, operation) {
   let providerUrl;
   try {
     const parsedBase = new URL(base);
-    if (!/^https?:$/.test(parsedBase.protocol)) throw new Error("unsupported protocol");
+    const hostname = parsedBase.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    const loopback = hostname === "localhost" || hostname === "::1" || hostname.startsWith("127.");
+    const insecureLoopbackAllowed = env.AGENT_ALLOW_INSECURE_LOOPBACK === "1" && loopback;
+    if (parsedBase.protocol !== "https:" && !(parsedBase.protocol === "http:" && insecureLoopbackAllowed)) throw new Error("secure protocol required");
+    if (parsedBase.username || parsedBase.password || parsedBase.search || parsedBase.hash) throw new Error("provider URL contains forbidden components");
     providerUrl = `${parsedBase.href.replace(/\/$/, "")}/chat/completions`;
   } catch {
     throw agentError("CONFIG_ERROR", "模型服务地址无效");
@@ -372,7 +378,7 @@ async function providerCall(messages, env, model, operation) {
         requestBody.reasoning_effort = "high";
       }
     }
-    const response = await fetch(providerUrl, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${env.AGENT_API_KEY}` }, body: JSON.stringify(requestBody), signal: controller.signal });
+    const response = await fetch(providerUrl, { method: "POST", redirect: "error", headers: { "content-type": "application/json", authorization: `Bearer ${env.AGENT_API_KEY}` }, body: JSON.stringify(requestBody), signal: controller.signal });
     const body = await readLimitedResponseText(response);
     if (!response.ok) throw agentError("PROVIDER_ERROR", `模型服务返回 ${response.status}`);
     let parsed;

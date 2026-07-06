@@ -82,6 +82,7 @@ test("OpenAI-compatible 适配器调用 chat/completions 并解析结构化结�
   const result = await runAgentOperation("rewrite", { text: "原文", instruction: "更自然" }, {
     AGENT_PROVIDER_MODE: "openai-compatible",
     AGENT_BASE_URL: `http://127.0.0.1:${port}`,
+    AGENT_ALLOW_INSECURE_LOOPBACK: "1",
     AGENT_API_KEY: "test-key",
     AGENT_MODEL: "test-model",
     AGENT_THINKING_MODE: "operation-based",
@@ -111,6 +112,7 @@ test("成稿和审核使用质量模型", async (t) => {
   await runAgentOperation("draft", { brief: validBrief, direction: validDirection, brand: {}, assets: [] }, {
     AGENT_PROVIDER_MODE: "openai-compatible",
     AGENT_BASE_URL: `http://127.0.0.1:${port}`,
+    AGENT_ALLOW_INSECURE_LOOPBACK: "1",
     AGENT_API_KEY: "test-key",
     AGENT_MODEL: "deepseek-v4-flash",
     AGENT_MODEL_QUALITY: "deepseek-v4-pro",
@@ -132,6 +134,22 @@ test("Agent 输入拒绝未声明字段和畸形嵌套对象", async () => {
     runAgentOperation("draft", { brief: validBrief, direction: { ...validDirection, outline: "not-an-array" }, brand: {} }),
     (error) => error?.code === "INVALID_INPUT",
   );
+  await assert.rejects(
+    runAgentOperation("interview", { campaignType: "product", idea: "测试", answers: [{ questionId: "q1", question: "问题", answer: "回答", role: "admin" }], brand: {} }),
+    (error) => error?.code === "INVALID_INPUT",
+  );
+});
+
+test("真实模型地址强制 HTTPS，仅显式允许回环开发服务", async () => {
+  await assert.rejects(
+    runAgentOperation("rewrite", { text: "原文", instruction: "自然", brand: {} }, {
+      AGENT_PROVIDER_MODE: "openai-compatible",
+      AGENT_BASE_URL: "http://provider.example.test/v1",
+      AGENT_API_KEY: "test-key",
+      AGENT_MODEL: "test-model",
+    }),
+    (error) => error?.code === "CONFIG_ERROR",
+  );
 });
 
 test("Agent 拒绝无效审核级别，避免绕过阻断规则", async (t) => {
@@ -147,6 +165,7 @@ test("Agent 拒绝无效审核级别，避免绕过阻断规则", async (t) => {
     runAgentOperation("audit", { articleText: "待审核正文", brief: validBrief, brand: {} }, {
       AGENT_PROVIDER_MODE: "openai-compatible",
       AGENT_BASE_URL: `http://127.0.0.1:${port}`,
+      AGENT_ALLOW_INSECURE_LOOPBACK: "1",
       AGENT_API_KEY: "test-key",
       AGENT_MODEL: "test-model",
     }),
@@ -167,6 +186,7 @@ test("Agent 拒绝超过响应大小上限的模型返回", async (t) => {
     runAgentOperation("rewrite", { text: "原文", instruction: "自然", brand: {} }, {
       AGENT_PROVIDER_MODE: "openai-compatible",
       AGENT_BASE_URL: `http://127.0.0.1:${port}`,
+      AGENT_ALLOW_INSECURE_LOOPBACK: "1",
       AGENT_API_KEY: "test-key",
       AGENT_MODEL: "test-model",
     }),

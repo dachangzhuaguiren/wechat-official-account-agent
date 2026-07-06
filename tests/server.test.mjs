@@ -29,6 +29,10 @@ test("服务健康检查、静态入口和 Mock Agent API 可用", async (t) => 
   assert.equal(browserAgentCore.status, 200);
   assert.match(await browserAgentCore.text(), /runAgentOperation/);
 
+  const workspaceSchema = await fetch(`${base}/workspace-schema.js`);
+  assert.equal(workspaceSchema.status, 200);
+  assert.match(await workspaceSchema.text(), /normalizeWorkspaceBackup/);
+
   const interview = await fetch(`${base}/api/agent/interview`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ campaignType: "product", idea: "新品宣传", answers: [], brand: {} }) });
   assert.equal(interview.status, 200);
   assert.equal((await interview.json()).status, "question");
@@ -53,6 +57,37 @@ test("Agent API 对同一来源执行速率限制", async (t) => {
   const limited = await fetch(url, init);
   assert.equal(limited.status, 429);
   assert.match((await limited.json()).error, /请求过于频繁/);
+});
+
+test("认证失败不会消耗合法模型额度，并有独立暴力尝试限制", async (t) => {
+  const token = "valid-access-token-that-is-at-least-32-characters";
+  const events = [];
+  const server = createServer({ providerMode: "mock", accessToken: token, rateLimitMax: 1, globalRateLimitMax: 1, authRateLimitMax: 1, securityLogger: (event) => events.push(event) }).listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => server.close());
+  const { port } = server.address();
+  const url = `http://127.0.0.1:${port}/api/agent/interview`;
+  const body = JSON.stringify({ campaignType: "product", idea: "新品宣传", answers: [], brand: {} });
+
+  const invalid = await fetch(url, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer invalid-token-that-is-long-enough" }, body });
+  assert.equal(invalid.status, 401);
+  const valid = await fetch(url, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body });
+  assert.equal(valid.status, 200);
+
+  assert.equal((await fetch(url, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer bad-token-one" }, body })).status, 401);
+  const authLimited = await fetch(url, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer bad-token-two" }, body });
+  assert.equal(authLimited.status, 429);
+  assert.equal(events.some((event) => event.event === "auth_rate_limited"), true);
+  assert.equal(JSON.stringify(events).includes(token), false);
+});
+
+test("服务器显式限制慢请求、请求头和单连接请求数", () => {
+  const server = createServer({ requestTimeout: 45_000, headersTimeout: 10_000, socketTimeout: 50_000, maxHeadersCount: 64, maxRequestsPerSocket: 32 });
+  assert.equal(server.requestTimeout, 45_000);
+  assert.equal(server.headersTimeout, 10_000);
+  assert.equal(server.timeout, 50_000);
+  assert.equal(server.maxHeadersCount, 64);
+  assert.equal(server.maxRequestsPerSocket, 32);
 });
 
 test("公开真实 AI API 拒绝未授权和非白名单来源", async (t) => {
@@ -178,6 +213,8 @@ test("Agent API 拒绝畸形 JSON、错误媒体类型和未声明字段", async
 test("CORS 同源判断同时校验协议和主机", async (t) => {
   assert.throws(() => createServer({ allowedOrigins: "*" }), /无效 Origin/);
   assert.throws(() => createServer({ allowedOrigins: "https://example.com/path" }), /精确的 HTTP\(S\) Origin/);
+  assert.throws(() => createServer({ allowedOrigins: "http://example.com" }), /精确的 HTTP\(S\) Origin/);
+  assert.doesNotThrow(() => createServer({ allowedOrigins: "http://127.0.0.1:3212" }));
   const server = createServer({ providerMode: "mock" }).listen(0, "127.0.0.1");
   await once(server, "listening");
   t.after(() => server.close());

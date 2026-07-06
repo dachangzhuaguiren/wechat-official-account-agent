@@ -1,6 +1,6 @@
 # 后端安全边界与 API 权限表
 
-审查日期：2026-07-05  
+审查日期：2026-07-06
 适用提交：本文件所在提交  
 生产入口：`https://k8w98rr595-blip.github.io/wechat-official-account-agent/`
 
@@ -16,8 +16,8 @@
 | 浏览器 → GitHub Pages | URL、导入备份、编辑内容、图片描述 | 仓库发布产物 | CSP、HTML 清洗、固定静态资源路径 |
 | 浏览器 → DeepSeek | 所有文章与提示词内容 | 使用者临时输入的 Key、固定官方 API 地址 | Key 仅内存保存、固定模型、输入/输出结构与长度校验、响应大小与超时限制 |
 | 客户端 → Node API | Origin、Host、转发头、Bearer Token、JSON Body | 服务端环境变量 | CORS 精确 Origin、Bearer Token、全局与来源限流、JSON 媒体类型和大小限制 |
-| Node API → 模型供应商 | 经校验的业务字段、模型返回 | API Key、Base URL、模型名 | HTTPS/HTTP URL 白名单、超时、最大输出 token、2MB 响应上限、深层模型结果校验 |
-| 浏览器 → IndexedDB | 导入的工作区和模型生成内容 | 当前浏览器同源存储 | HTML DOM 清洗、备份 25MB 上限；不保存 API Key |
+| Node API → 模型供应商 | 经校验的业务字段、模型返回 | API Key、Base URL、模型名 | 强制 HTTPS；仅显式允许回环开发 HTTP；禁止重定向；超时、最大输出 token、2MB 响应上限、深层模型结果校验 |
+| 浏览器 → IndexedDB | 导入的工作区和模型生成内容 | 当前浏览器同源存储 | HTML DOM 清洗、完整备份 Schema、项目/字段/图片上限、可选 AES-GCM 加密备份；不保存 API Key 或访问码 |
 
 ## 2. 身份与能力
 
@@ -37,7 +37,7 @@
 |---|---|---|---|---|---|
 | `GET /api/health` | `health:read`（公开） | 无；默认只返回 `{ok:true}` | 无业务输入；CORS 仍按 Origin 执行 | 无 | `no-store`，不暴露模型或 Secret 状态；仅显式开启 `EXPOSE_HEALTH_DETAILS=1` 才返回详情 |
 | `OPTIONS /api/*` | CORS 预检（公开） | Origin 必须是精确同源或在 `ALLOWED_ORIGINS` | 只允许 `GET, POST, OPTIONS` 与 `authorization, content-type` | 无 | 204，缓存 600 秒 |
-| `POST /api/agent/interview` | `agent:invoke` | 共享 Bearer Token；真实模型无 Token 时拒绝。无认证例外仅限本机回环 | `campaignType` 枚举；idea ≤ 4000；回答 ≤ 8，每项 ID/文本受限；品牌字段白名单 | 调用 Flash；最多 2000 输出 tokens；最多一次结构修复重试 | 返回单问题或完整简报；失败只记录 requestId、固定操作名和错误代码，不记录正文或 Key |
+| `POST /api/agent/interview` | `agent:invoke` | 共享 Bearer Token；真实模型无 Token 时拒绝。无认证例外仅限本机回环 | `campaignType` 枚举；idea ≤ 4000；回答 ≤ 8，每项只允许 ID、原问题和回答且长度受限；品牌字段白名单 | 调用 Flash；最多 2000 输出 tokens；最多一次结构修复重试 | 返回单问题或完整简报；安全日志只记录 requestId、固定操作名、状态和可选 HMAC 来源标识，不记录正文或 Key |
 | `POST /api/agent/directions` | `agent:invoke` | 同上 | 顶层字段白名单；简报所有字段、字符串和数组深层校验 | 调用 Flash；最多 3000 输出 tokens | 必须返回恰好 3 个方向，每项 ID、标题、角度、提纲均校验 |
 | `POST /api/agent/draft` | `agent:invoke` | 同上 | 简报、方向和品牌深层校验；图片 ≤ 20，仅接收名称、描述和 MIME，不接收图片二进制 | 调用 Pro；高强度思考；最多 12000 输出 tokens | HTML ≤ 200KB，并移除未知标签、脚本、样式和危险链接属性 |
 | `POST /api/agent/rewrite` | `agent:invoke` | 同上 | 原文 ≤ 12000；指令 ≤ 1000；品牌/简报字段白名单 | 调用 Flash；最多 3000 输出 tokens | replacement 必须是 1–20000 字符字符串 |
@@ -45,7 +45,7 @@
 | 其他 `/api/*` 或错误方法 | 无 | 默认拒绝 | 路由和方法固定白名单 | 无 | 404，不暴露内部路由 |
 | 固定静态资源 `GET /` 等 | `static:read`（公开） | 无 | `Map` 固定路径，不接受文件路径参数 | 读取仓库内固定文件 | CSP、`nosniff`、`no-referrer`、禁用 framing/权限能力 |
 
-所有 Agent POST 请求还统一执行：1MB 请求体上限、`application/json`/`+json` 媒体类型、每来源限流、全局限流、限流桶数量上限、CORS 精确协议/主机校验和最小错误响应。
+所有 Agent POST 请求还统一执行：1MB 请求体上限、`application/json`/`+json` 媒体类型、认证失败独立限流、认证后来源/全局模型额度、限流桶数量上限、CORS 精确协议/主机校验、请求/请求头/连接超时和最小错误响应。
 
 ## 4. 已确认并修复的问题
 
@@ -60,14 +60,19 @@
 | 低 | 接受任意 Content-Type | 非预期客户端可绕过接口契约 | 仅接受 `application/json` 或 `+json`，否则 415 |
 | 低 | 健康接口暴露模型模式与保护状态 | 匿名扫描者获取部署细节 | 默认只返回 `{ok:true}`，详情需显式配置 |
 | 中 | DeepSeek Key 存入 `sessionStorage` | 同源脚本可通过 Storage API 读取 Key | 改为模块闭包内存；刷新即清除；CSP 限制脚本和连接目标；iframe 中拒绝接收 Key |
+| 高 | 模型 Base URL 允许普通 HTTP | 配置错误时服务端 API Key 可能通过明文网络发送 | 生产强制 HTTPS；只有 `AGENT_ALLOW_INSECURE_LOOPBACK=1` 且目标为回环地址时允许 HTTP；Fetch 禁止重定向 |
+| 中 | 备份只做顶层检查 | 恶意备份字段进入 HTML 属性、图片地址或超大数组，造成注入与持久化拒绝服务 | 新增深层 Schema、字段白名单、状态一致性、ID/颜色/Data URL、数量和长度校验；增加加密备份与清除本地数据 |
+| 中 | 无效 Token 在认证前消耗模型额度 | 攻击者重复发送错误 Token，使合法用户收到 429 | 认证失败使用独立来源桶；只有认证成功请求才扣除来源和全局模型额度 |
+| 中 | 服务器采用较宽松默认连接参数 | 慢速请求占用单进程连接 | 显式限制请求、请求头、Socket、Keep-Alive、Header 数和单连接请求数 |
+| 中 | GitHub Actions 使用可变主版本标签 | 上游标签被替换时部署链可能执行未审查代码 | 所有 Action 固定到完整 Commit SHA；Dependabot 只通过 PR 提议升级；增加 CODEOWNERS 与 SECURITY.md |
 
 ## 5. 错误、日志与 Secret
 
 - API Key、Bearer Token、文章正文和提示词不得进入日志。
-- 安全失败日志仅包含随机 `requestId`、固定 operation、内部错误代码和错误类型。
+- 安全失败日志为结构化 JSON，只包含随机 `requestId`、固定 operation/event、状态、内部错误代码和可选 HMAC 来源标识。
 - 5xx 向客户端返回稳定的泛化信息；供应商错误正文和堆栈不返回。
 - `.env.local` 被 Git 忽略；生产 Secret 必须使用托管平台 Secret，不得写入 GitHub Pages、Actions 变量或构建产物。
-- Pages 模式不保存 DeepSeek Key；刷新页面后需要重新输入。
+- Pages 模式不保存 DeepSeek Key；独立后端访问码也只保存在内存，刷新页面后需要重新输入。
 
 ## 6. 残余风险与部署检查
 
@@ -76,6 +81,7 @@
 3. 后端限流是单进程内存状态，多实例部署必须改用 Redis/托管限流服务，否则实例之间不能共享计数。
 4. 共享 Token 没有用户身份、独立配额、到期时间或审计主体，只适合个人/单一受信客户端。
 5. 模型输出经过结构和 HTML 安全校验，但内容事实正确性仍需人工确认，发布审核不能视为法律或合规保证。
+6. GitHub Pages 无法设置响应头级 CSP/`frame-ancestors`；应用已在 iframe 中停止加载，但完整响应头仍需 Cloudflare/Vercel 等边缘层。
 
 独立后端上线前必须确认：
 
@@ -84,8 +90,11 @@
 - 只有在唯一且受信的反向代理后才设置 `TRUST_PROXY=1`。
 - `ALLOWED_ORIGINS` 只列精确 HTTPS Origin，不包含通配符或路径。
 - 平台强制 HTTPS/HSTS；服务端 Key 存在 Secret Manager；日志有访问控制和保留期限。
+- `AGENT_BASE_URL` 使用 HTTPS；生产禁止 `AGENT_ALLOW_INSECURE_LOOPBACK=1`。
+- `AUDIT_LOG_KEY` 使用至少 32 字符随机值，以便生成不可逆来源标识。
 - 多实例部署使用共享限流与集中安全审计日志。
+- GitHub `main` 启用分支保护、必需检查和 CODEOWNERS 审核；仓库管理员启用 2FA/Passkey。
 
 ## 7. 自动化证据
 
-安全回归覆盖：全部五个 Agent 路由的未认证拒绝、合法 Token、低强度 Token、非白名单 Origin、协议混淆 Origin、CORS 预检、代理头伪造、来源/全局限流基础路径、畸形 JSON、错误媒体类型、未声明字段、畸形嵌套对象、无效审核 severity、超大模型响应、HTML 清洗、Pages CSP、Key 非持久化和 iframe 防护。
+安全回归覆盖：全部五个 Agent 路由的未认证拒绝、合法 Token、低强度 Token、认证失败独立限流、非白名单 Origin、协议混淆 Origin、CORS 预检、代理头伪造、来源/全局限流、畸形 JSON、错误媒体类型、未声明字段、畸形嵌套对象、HTTP 模型地址拒绝、无效审核 severity、超大模型响应、服务器超时、HTML 清洗、Pages CSP、所有访问密钥非持久化、iframe 防护、恶意备份字段/图片/大小/重复 ID 与 AES-GCM 备份篡改。
