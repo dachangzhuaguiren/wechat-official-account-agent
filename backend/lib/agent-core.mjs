@@ -349,7 +349,7 @@ async function readLimitedResponseText(response, maxBytes = 2_000_000) {
   return new TextDecoder().decode(merged);
 }
 
-async function providerCall(messages, env, model, operation) {
+async function providerCall(messages, env, model, operation, providerUserId) {
   const base = String(env.AGENT_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
   if (!env.AGENT_API_KEY || !model) throw agentError("CONFIG_ERROR", "模型服务尚未完成配置");
   let providerUrl;
@@ -370,6 +370,7 @@ async function providerCall(messages, env, model, operation) {
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const requestBody = { model, temperature: 0.45, max_tokens: maxOutputTokens(operation, env), response_format: { type: "json_object" }, messages };
+    if (typeof providerUserId === "string" && /^[a-f0-9]{16,64}$/.test(providerUserId)) requestBody.user_id = providerUserId;
     if (env.AGENT_THINKING_MODE === "operation-based") {
       const thinkingEnabled = ["draft", "audit"].includes(operation);
       requestBody.thinking = { type: thinkingEnabled ? "enabled" : "disabled" };
@@ -408,13 +409,13 @@ export async function runAgentOperation(operation, payload, env = process.env, o
     { role: "system", content: `${SYSTEM_PROMPTS[operation]}\n必须只返回有效 JSON，不要使用 Markdown 代码块。输出必须严格符合以下结构，字段名不得替换：\n${resultSchema}` },
     { role: "user", content: JSON.stringify(payload) },
   ];
-  let providerResult = await providerCall(messages, env, model, operation);
+  let providerResult = await providerCall(messages, env, model, operation, options.providerUserId);
   let content = providerResult.content;
   const usage = { inputTokens: providerResult.usage.inputTokens, outputTokens: providerResult.usage.outputTokens };
   let result;
   try { result = validateResult(operation, parseJson(content)); }
   catch {
-    providerResult = await providerCall([...messages, { role: "assistant", content }, { role: "user", content: `上一个结果字段不符合要求。请严格修复为以下结构，只返回 JSON：\n${resultSchema}` }], env, model, operation);
+    providerResult = await providerCall([...messages, { role: "assistant", content }, { role: "user", content: `上一个结果字段不符合要求。请严格修复为以下结构，只返回 JSON：\n${resultSchema}` }], env, model, operation, options.providerUserId);
     content = providerResult.content;
     usage.inputTokens += providerResult.usage.inputTokens;
     usage.outputTokens += providerResult.usage.outputTokens;

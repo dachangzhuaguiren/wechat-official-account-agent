@@ -328,9 +328,12 @@ export function createServer(options = {}) {
       }
 
       try {
-        const result = await runAgentOperation(operation, await readJson(request), operationEnv, { onUsage: (usage) => {
-          if (saasContext) saasService.recordUsage(saasContext, { ...usage, costMicrousd: usageCostMicrousd(usage, operationEnv), requestId });
-        } });
+        const result = await runAgentOperation(operation, await readJson(request), operationEnv, {
+          providerUserId: saasContext ? sourceIdentifier(`tenant:${saasContext.organizationId}`, auditLogKey) : undefined,
+          onUsage: (usage) => {
+            if (saasContext) saasService.recordUsage(saasContext, { ...usage, costMicrousd: usageCostMicrousd(usage, operationEnv), requestId });
+          },
+        });
         if (saasContext) saasService.commitAgentOperation(saasContext, operation, idempotencyKey);
         return json(response, 200, result, { ...cors, "x-request-id": requestId });
       } catch (error) {
