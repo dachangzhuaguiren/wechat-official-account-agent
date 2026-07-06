@@ -42,6 +42,10 @@ test("SaaS 注册、登录和会话不会暴露密码哈希", async (t) => {
   const login = await request(base, "/api/saas/login", { method: "POST", body: { email: "OWNER@example.com", password: "strong-pass-2026" } });
   assert.equal(login.status, 200);
   assert.equal(JSON.stringify(login.body).includes("password"), false);
+  const updated = await request(base, "/api/saas/profile", { method: "PATCH", token: login.body.token, body: { name: "Updated Owner" } });
+  assert.equal(updated.status, 200);
+  assert.equal(updated.body.user.name, "Updated Owner");
+  assert.equal((await request(base, "/api/saas/profile", { method: "PATCH", token: login.body.token, body: { name: "Owner", platformAdmin: true } })).status, 400);
   const stored = service.store.getUserByEmail("owner@example.com");
   assert.match(stored.password_hash, /^scrypt\$/);
   assert.equal(stored.password_hash.includes("strong-pass-2026"), false);

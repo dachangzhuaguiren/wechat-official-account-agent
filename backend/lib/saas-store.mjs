@@ -228,6 +228,13 @@ export class SaasStore {
   getUserByEmail(email) { return this.db.prepare("SELECT * FROM users WHERE email = ?").get(email); }
   getUserById(id) { return this.db.prepare("SELECT * FROM users WHERE id = ?").get(id); }
 
+  updateUserName(userId, name) {
+    const timestamp = nowIso();
+    this.db.prepare("UPDATE users SET name = ?, updated_at = ? WHERE id = ?").run(name, timestamp, userId);
+    this.audit({ actorUserId: userId, event: "user.profile_updated", targetType: "user", targetId: userId, detail: { fields: ["name"] } });
+    return publicUser(this.getUserById(userId));
+  }
+
   createSession(userId, tokenHash, expiresAt) {
     const timestamp = nowIso();
     this.db.prepare("INSERT INTO sessions (token_hash, user_id, expires_at, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?)")

@@ -165,6 +165,13 @@ export class SaasService {
     return { user: auth.user, organizations };
   }
 
+  updateProfile(rawToken, payload) {
+    const auth = this.authenticate(rawToken);
+    const value = object(payload, "profile");
+    allowed(value, ["name"], "profile");
+    return { user: this.store.updateUserName(auth.user.id, text(value.name, "name", { min: 2, max: 60 })) };
+  }
+
   organization(rawToken, organizationId) {
     const context = this.context(rawToken, organizationId);
     const organization = this.store.getOrganization(context.organizationId);
