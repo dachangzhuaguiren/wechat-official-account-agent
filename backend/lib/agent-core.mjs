@@ -386,7 +386,11 @@ async function providerCall(messages, env, model, operation) {
     catch { throw agentError("PROVIDER_ERROR", "模型服务返回了无效响应"); }
     const content = parsed.choices?.[0]?.message?.content;
     if (!content) throw agentError("PROVIDER_ERROR", "模型服务未返回正文");
-    return content;
+    const usage = parsed.usage && typeof parsed.usage === "object" ? {
+      inputTokens: Math.max(0, Number(parsed.usage.prompt_tokens ?? parsed.usage.input_tokens) || 0),
+      outputTokens: Math.max(0, Number(parsed.usage.completion_tokens ?? parsed.usage.output_tokens) || 0),
+    } : { inputTokens: 0, outputTokens: 0 };
+    return { content, usage };
   } catch (error) {
     if (error?.code) throw error;
     if (error?.name === "AbortError") throw agentError("PROVIDER_ERROR", "模型服务响应超时");
@@ -394,7 +398,7 @@ async function providerCall(messages, env, model, operation) {
   } finally { clearTimeout(timeout); }
 }
 
-export async function runAgentOperation(operation, payload, env = process.env) {
+export async function runAgentOperation(operation, payload, env = process.env, options = {}) {
   if (!Object.hasOwn(SYSTEM_PROMPTS, operation)) throw new Error("未知 Agent 操作");
   validateOperationPayload(operation, payload);
   if ((env.AGENT_PROVIDER_MODE || "mock") === "mock") return runMockOperation(operation, payload);
@@ -404,14 +408,20 @@ export async function runAgentOperation(operation, payload, env = process.env) {
     { role: "system", content: `${SYSTEM_PROMPTS[operation]}\n必须只返回有效 JSON，不要使用 Markdown 代码块。输出必须严格符合以下结构，字段名不得替换：\n${resultSchema}` },
     { role: "user", content: JSON.stringify(payload) },
   ];
-  let content = await providerCall(messages, env, model, operation);
+  let providerResult = await providerCall(messages, env, model, operation);
+  let content = providerResult.content;
+  const usage = { inputTokens: providerResult.usage.inputTokens, outputTokens: providerResult.usage.outputTokens };
   let result;
   try { result = validateResult(operation, parseJson(content)); }
   catch {
-    content = await providerCall([...messages, { role: "assistant", content }, { role: "user", content: `上一个结果字段不符合要求。请严格修复为以下结构，只返回 JSON：\n${resultSchema}` }], env, model, operation);
+    providerResult = await providerCall([...messages, { role: "assistant", content }, { role: "user", content: `上一个结果字段不符合要求。请严格修复为以下结构，只返回 JSON：\n${resultSchema}` }], env, model, operation);
+    content = providerResult.content;
+    usage.inputTokens += providerResult.usage.inputTokens;
+    usage.outputTokens += providerResult.usage.outputTokens;
     try { result = validateResult(operation, parseJson(content)); }
     catch { throw agentError("PROVIDER_ERROR", "模型返回结构不符合要求"); }
   }
   if (operation === "draft") result.articleHtml = sanitizeArticleHtml(result.articleHtml);
+  options.onUsage?.({ operation, model, ...usage });
   return result;
 }

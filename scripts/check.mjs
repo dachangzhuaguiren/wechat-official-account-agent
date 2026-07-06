@@ -5,6 +5,9 @@ import { fileURLToPath } from "node:url";
 const required = [
   "backend/server.mjs",
   "backend/lib/agent-core.mjs",
+  "backend/lib/saas-store.mjs",
+  "backend/lib/saas-service.mjs",
+  "backend/lib/saas-router.mjs",
   "frontend/public/index.html",
   "frontend/public/app.js",
   "frontend/public/workspace-schema.js",
@@ -22,6 +25,9 @@ for (const file of required) {
 for (const file of [
   "backend/server.mjs",
   "backend/lib/agent-core.mjs",
+  "backend/lib/saas-store.mjs",
+  "backend/lib/saas-service.mjs",
+  "backend/lib/saas-router.mjs",
   "frontend/public/app.js",
   "frontend/public/workspace-schema.js",
   "frontend/public/backup-crypto.js",

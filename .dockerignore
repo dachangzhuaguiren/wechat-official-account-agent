@@ -1,0 +1,11 @@
+.git
+.github
+.env.local
+data
+dist
+output
+coverage
+node_modules
+*.log
+*.sqlite*
+design-qa.md

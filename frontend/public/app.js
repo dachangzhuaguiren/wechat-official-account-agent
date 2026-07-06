@@ -13,13 +13,22 @@ let selectedRange;
 let selectedText = "";
 let rewritePreview;
 let saveTimer;
+let saveChain = Promise.resolve();
 let deepSeekApiKey = "";
 let remoteAccessToken = "";
 const configuredApiBaseUrl = String(window.AGENT_CONFIG?.apiBaseUrl || "").replace(/\/$/, "");
+const saasEnabled = Boolean(window.AGENT_CONFIG?.saasEnabled);
 const remoteAgentConfigured = Boolean(configuredApiBaseUrl);
-const directDeepSeekMode = location.hostname.endsWith(".github.io") && !remoteAgentConfigured;
+const directDeepSeekMode = location.hostname.endsWith(".github.io") && !remoteAgentConfigured && !saasEnabled;
 const embeddedMode = window.self !== window.top;
 let staticAgentMode = location.protocol === "file:";
+let saasSessionToken = sessionStorage.getItem("wechat-saas-session") || "";
+let saasUser;
+let saasOrganizations = [];
+let activeOrganizationId = sessionStorage.getItem("wechat-saas-organization") || "";
+let activeOrganizationRole = "";
+let activeSubscription;
+let cloudWorkspaceVersion = 0;
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -50,7 +59,7 @@ function openDatabase() {
   });
 }
 
-async function loadWorkspace() {
+async function loadLocalWorkspace() {
   const db = await openDatabase();
   return new Promise((resolve, reject) => {
     const request = db.transaction("workspace", "readonly").objectStore("workspace").get("current");
@@ -71,7 +80,7 @@ function sanitizeWorkspaceContent(value) {
   return value;
 }
 
-async function persistWorkspace() {
+async function persistLocalWorkspace() {
   const db = await openDatabase();
   return new Promise((resolve, reject) => {
     const request = db.transaction("workspace", "readwrite").objectStore("workspace").put(workspace, "current");
@@ -80,9 +89,72 @@ async function persistWorkspace() {
   });
 }
 
+async function saasRequest(path, { method = "GET", body, organization = true } = {}) {
+  const response = await fetch(`${configuredApiBaseUrl}/api/saas${path}`, {
+    method,
+    headers: {
+      ...(body === undefined ? {} : { "content-type": "application/json" }),
+      ...(saasSessionToken ? { authorization: `Bearer ${saasSessionToken}` } : {}),
+      ...(organization && activeOrganizationId ? { "x-organization-id": activeOrganizationId } : {}),
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const result = response.headers.get("content-type")?.includes("application/json") ? await response.json() : { error: "服务返回了无法解析的响应" };
+  if (!response.ok) {
+    if (response.status === 401 && saasSessionToken) clearSaasSession();
+    const error = new Error(result.error || "SaaS 请求失败");
+    error.code = result.code;
+    error.status = response.status;
+    error.currentVersion = result.currentVersion;
+    throw error;
+  }
+  return result;
+}
+
+function clearSaasSession() {
+  saasSessionToken = "";
+  saasUser = undefined;
+  saasOrganizations = [];
+  activeOrganizationId = "";
+  activeOrganizationRole = "";
+  activeSubscription = undefined;
+  sessionStorage.removeItem("wechat-saas-session");
+  sessionStorage.removeItem("wechat-saas-organization");
+}
+
+function acceptSaasSession(result) {
+  saasSessionToken = result.token;
+  saasUser = result.user;
+  saasOrganizations = result.organizations || [];
+  activeOrganizationId = saasOrganizations.some((item) => item.organization.id === activeOrganizationId)
+    ? activeOrganizationId
+    : saasOrganizations[0]?.organization.id || result.organization?.id || "";
+  sessionStorage.setItem("wechat-saas-session", saasSessionToken);
+  sessionStorage.setItem("wechat-saas-organization", activeOrganizationId);
+}
+
+async function loadCloudWorkspace() {
+  const result = await saasRequest("/workspace");
+  cloudWorkspaceVersion = result.version;
+  workspace = sanitizeWorkspaceContent(normalizeWorkspaceBackup(result.data));
+  const organization = await saasRequest("/organization");
+  activeOrganizationRole = organization.role;
+  activeSubscription = organization.subscription;
+}
+
+async function persistWorkspace() {
+  if (!saasEnabled || !saasSessionToken) return persistLocalWorkspace();
+  const result = await saasRequest("/workspace", { method: "PUT", body: { version: cloudWorkspaceVersion, data: workspace } });
+  cloudWorkspaceVersion = result.version;
+}
+
 function scheduleSave() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => persistWorkspace().catch(() => showToast("自动保存失败，请导出备份", "error")), 350);
+  saveTimer = setTimeout(() => {
+    saveChain = saveChain.then(() => persistWorkspace()).catch((error) => {
+      showToast(error?.code === "VERSION_CONFLICT" ? "云端版本已变化，请刷新页面后继续" : "自动保存失败，请导出备份", "error");
+    });
+  }, 350);
 }
 
 function updateProject(id, updater) {
@@ -112,7 +184,8 @@ async function api(operation, payload) {
     }
   }
   if (remoteAgentConfigured) {
-    if (!remoteAccessToken) {
+    if (saasEnabled && !saasSessionToken) throw new Error("请先登录企业工作区");
+    if (!saasEnabled && !remoteAccessToken) {
       remoteAccessToken = String(window.prompt("请输入写作 Agent 访问码。它不是 DeepSeek API Key。") || "").trim();
       if (!remoteAccessToken) throw new Error("需要访问码才能使用真实 AI");
     }
@@ -122,7 +195,8 @@ async function api(operation, payload) {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        ...(remoteAccessToken ? { authorization: `Bearer ${remoteAccessToken}` } : {}),
+        ...(saasEnabled ? { authorization: `Bearer ${saasSessionToken}`, "x-organization-id": activeOrganizationId, ...(operation === "draft" ? { "x-idempotency-key": uid() } : {}) } : {}),
+        ...(!saasEnabled && remoteAccessToken ? { authorization: `Bearer ${remoteAccessToken}` } : {}),
       },
       body: JSON.stringify(payload),
     });
@@ -132,7 +206,11 @@ async function api(operation, payload) {
       return runStaticAgentOperation(operation, payload);
     }
     const result = isJson ? await response.json() : { error: "服务返回了无法解析的响应" };
-    if (remoteAgentConfigured && response.status === 401) {
+    if (saasEnabled && response.status === 401) {
+      clearSaasSession();
+      throw new Error("登录已失效，请重新登录");
+    }
+    if (remoteAgentConfigured && !saasEnabled && response.status === 401) {
       remoteAccessToken = "";
       throw new Error("访问码不正确，请重新操作并输入正确的访问码");
     }
@@ -172,6 +250,7 @@ function requestDeepSeekApiKey() {
 }
 
 function agentStatusLabel() {
+  if (saasEnabled) return `DeepSeek V4 · ${activeSubscription?.draftsRemaining ?? "-"}篇`;
   if (remoteAgentConfigured || directDeepSeekMode) return "DeepSeek V4";
   return staticAgentMode ? "演示模式" : "本地 AI";
 }
@@ -378,7 +457,7 @@ async function confirmBrief() {
 async function generateDraft() {
   const project = activeProject(); const direction = project?.directions.find((item) => item.id === project.selectedDirectionId);
   if (!project?.brief || !direction) return;
-  await runTask(async () => { const result = await api("draft", { brief: project.brief, direction, brand: workspace.brand, assets: project.assets.map(({ name, description }) => ({ name, description })) }); project.articleHtml = result.articleHtml; project.status = "draft"; project.versions.unshift({ id: uid(), html: result.articleHtml, reason: "生成初稿", createdAt: now() }); project.updatedAt = now(); scheduleSave(); });
+  await runTask(async () => { const result = await api("draft", { brief: project.brief, direction, brand: workspace.brand, assets: project.assets.map(({ name, description }) => ({ name, description })) }); project.articleHtml = result.articleHtml; project.status = "draft"; project.versions.unshift({ id: uid(), html: result.articleHtml, reason: "生成初稿", createdAt: now() }); project.updatedAt = now(); if (saasEnabled) activeSubscription = (await saasRequest("/subscription")).subscription; scheduleSave(); });
   renderAll();
 }
 
@@ -541,9 +620,127 @@ async function importBackup(file) {
   catch (error) { showToast(error instanceof Error ? error.message : "导入失败", "error"); }
 }
 
+async function requestSaasAuthentication() {
+  return new Promise((resolve) => {
+    const root = $("#modal-root");
+    let mode = "login";
+    const render = () => {
+      const registering = mode === "register";
+      root.innerHTML = `<div class="modal-backdrop"><section class="modal" role="dialog" aria-modal="true" aria-label="登录企业工作区"><header class="modal-header"><h2>企业工作区</h2></header><form id="saas-auth-form" class="modal-form"><div class="auth-switch"><button type="button" data-auth-mode="login" class="${registering ? "" : "selected"}">登录</button><button type="button" data-auth-mode="register" class="${registering ? "selected" : ""}">创建企业</button></div><p>${registering ? "创建企业工作区，开始14天试用。数据会安全同步到云端。" : "登录后继续访问企业项目、成员与使用额度。"}</p>${registering ? '<label>姓名<input name="name" autocomplete="name" maxlength="60" required></label><label>企业名称<input name="organizationName" autocomplete="organization" maxlength="80" required></label>' : ""}<label>邮箱<input name="email" type="email" autocomplete="email" maxlength="254" required></label><label>密码<input name="password" type="password" autocomplete="${registering ? "new-password" : "current-password"}" minlength="10" maxlength="128" required></label>${registering ? '<label>平台初始化码（普通用户留空）<input name="bootstrapToken" type="password" autocomplete="off" maxlength="128"></label>' : ""}<button class="button primary full" type="submit">${registering ? "创建并进入" : "登录"}</button><p id="auth-error" class="inline-warning" hidden></p></form></section></div>`;
+      $$('[data-auth-mode]', root).forEach((button) => button.addEventListener("click", () => { mode = button.dataset.authMode; render(); }));
+      $("#saas-auth-form", root).addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const button = $('button[type="submit"]', event.currentTarget);
+        const errorBox = $("#auth-error", root);
+        button.disabled = true; errorBox.hidden = true;
+        try {
+          const data = Object.fromEntries(new FormData(event.currentTarget));
+          const result = await saasRequest(registering ? "/register" : "/login", { method: "POST", body: data, organization: false });
+          acceptSaasSession(result);
+          root.innerHTML = "";
+          resolve(result);
+        } catch (error) {
+          errorBox.textContent = error instanceof Error ? error.message : "登录失败";
+          errorBox.hidden = false;
+          button.disabled = false;
+        }
+      });
+      $('input[name="email"]', root)?.focus();
+    };
+    render();
+  });
+}
+
+async function ensureSaasSession() {
+  if (saasSessionToken) {
+    try {
+      const current = await saasRequest("/me", { organization: false });
+      saasUser = current.user;
+      saasOrganizations = current.organizations || [];
+      if (!saasOrganizations.some((item) => item.organization.id === activeOrganizationId)) activeOrganizationId = saasOrganizations[0]?.organization.id || "";
+      if (activeOrganizationId) sessionStorage.setItem("wechat-saas-organization", activeOrganizationId);
+      return;
+    } catch { clearSaasSession(); }
+  }
+  await requestSaasAuthentication();
+}
+
+function renderSaasChrome() {
+  const organization = saasOrganizations.find((item) => item.organization.id === activeOrganizationId)?.organization;
+  $("#organization-settings").hidden = !saasEnabled;
+  $("#billing-settings").hidden = !saasEnabled;
+  $("#admin-console").hidden = !saasEnabled || !saasUser?.platformAdmin;
+  $("#account-status").textContent = saasEnabled ? `${organization?.name || "企业工作区"} · ${saasUser?.name || "未登录"}` : "本地工作区";
+  $("#storage-status").innerHTML = `${icon("hard-drive")}${saasEnabled ? "企业云端实时同步" : "数据仅保存在此浏览器"}`;
+  $("#clear-local-data").innerHTML = `${icon("trash")}${saasEnabled ? "清空企业云端" : "清除本地数据"}`;
+  $("#new-project").disabled = saasEnabled && activeOrganizationRole === "reviewer";
+  $("#brand-settings").disabled = saasEnabled && activeOrganizationRole === "reviewer";
+}
+
+async function showAccountMenu() {
+  if (!saasEnabled) return openModal("当前工作区", '<div class="account-summary"><p>当前为个人本地模式，项目仅保存在这个浏览器中。</p></div>');
+  const organizationRows = saasOrganizations.map((item) => `<div class="data-row"><div class="data-row-copy"><strong>${escapeHtml(item.organization.name)}</strong><small>${escapeHtml(item.role)}${item.organization.id === activeOrganizationId ? " · 当前" : ""}</small></div>${item.organization.id === activeOrganizationId ? "" : `<button class="button secondary" data-switch-organization="${item.organization.id}" type="button">切换</button>`}</div>`).join("");
+  openModal("账户与工作区", `<div class="account-summary"><dl><div><dt>姓名</dt><dd>${escapeHtml(saasUser?.name)}</dd></div><div><dt>邮箱</dt><dd>${escapeHtml(saasUser?.email)}</dd></div></dl><div class="data-list">${organizationRows}</div><button id="saas-logout" class="button secondary full" type="button">退出登录</button></div>`, (root) => {
+    $$('[data-switch-organization]', root).forEach((button) => button.addEventListener("click", async () => {
+      await saveChain;
+      activeOrganizationId = button.dataset.switchOrganization;
+      sessionStorage.setItem("wechat-saas-organization", activeOrganizationId);
+      await loadCloudWorkspace(); closeModal(); renderAll(); showToast("已切换企业工作区");
+    }));
+    $("#saas-logout", root).addEventListener("click", async () => {
+      try { await saasRequest("/logout", { method: "POST", body: {}, organization: false }); } catch { /* local cleanup still applies */ }
+      clearSaasSession(); location.reload();
+    });
+  });
+}
+
+async function showOrganizationSettings() {
+  try {
+    const [{ members }, organizationInfo] = await Promise.all([saasRequest("/members"), saasRequest("/organization")]);
+    const canManage = ["owner", "admin"].includes(organizationInfo.role);
+    const rows = members.map((member) => `<div class="data-row"><div class="data-row-copy"><strong>${escapeHtml(member.name)}</strong><small>${escapeHtml(member.email)} · ${escapeHtml(member.role)}</small></div>${canManage && member.role !== "owner" && member.id !== saasUser.id ? `<div class="data-row-actions"><select data-member-role="${member.id}">${["admin", "editor", "reviewer"].map((role) => `<option value="${role}" ${member.role === role ? "selected" : ""}>${role}</option>`).join("")}</select><button class="button secondary" data-remove-member="${member.id}" type="button">移除</button></div>` : ""}</div>`).join("");
+    openModal("企业与成员", `<section class="saas-section"><div class="saas-section-header"><div><h3>${escapeHtml(organizationInfo.organization.name)}</h3><p>当前角色：${escapeHtml(organizationInfo.role)} · ${members.length}/${organizationInfo.subscription.seatLimit} 名成员</p></div></div>${canManage ? `<form id="organization-name-form" class="inline-form"><input name="name" value="${escapeHtml(organizationInfo.organization.name)}" maxlength="80" required><span></span><button class="button secondary" type="submit">更新名称</button></form>` : ""}</section><section class="saas-section"><div class="saas-section-header"><div><h3>成员权限</h3><p>审核人只读；编辑可创作；管理员可管理成员与账单。</p></div></div>${canManage ? '<form id="add-member-form" class="inline-form"><input name="email" type="email" placeholder="已注册成员邮箱" required><select name="role"><option value="editor">编辑</option><option value="reviewer">审核人</option><option value="admin">管理员</option></select><button class="button primary" type="submit">添加</button></form>' : ""}<div class="data-list">${rows}</div></section>`, (root) => {
+      $("#organization-name-form", root)?.addEventListener("submit", async (event) => { event.preventDefault(); await saasRequest("/organization", { method: "PATCH", body: { name: new FormData(event.currentTarget).get("name") } }); closeModal(); await showOrganizationSettings(); renderSaasChrome(); });
+      $("#add-member-form", root)?.addEventListener("submit", async (event) => { event.preventDefault(); const data = Object.fromEntries(new FormData(event.currentTarget)); try { await saasRequest("/members", { method: "POST", body: data }); closeModal(); await showOrganizationSettings(); } catch (error) { showToast(error.message, "error"); } });
+      $$('[data-member-role]', root).forEach((select) => select.addEventListener("change", async () => { try { await saasRequest(`/members/${select.dataset.memberRole}`, { method: "PATCH", body: { role: select.value } }); showToast("成员角色已更新"); } catch (error) { showToast(error.message, "error"); } }));
+      $$('[data-remove-member]', root).forEach((button) => button.addEventListener("click", async () => { if (!confirm("确认移除该成员？")) return; try { await saasRequest(`/members/${button.dataset.removeMember}`, { method: "DELETE" }); closeModal(); await showOrganizationSettings(); } catch (error) { showToast(error.message, "error"); } }));
+    }, true);
+  } catch (error) { showToast(error.message, "error"); }
+}
+
+async function showBillingSettings() {
+  try {
+    const [{ subscription, plans }, { orders }] = await Promise.all([saasRequest("/subscription"), saasRequest("/orders")]);
+    activeSubscription = subscription; renderAgent();
+    const usedPercent = subscription.draftQuota ? Math.min(100, Math.round(subscription.draftsUsed / subscription.draftQuota * 100)) : 0;
+    const planRows = plans.filter((plan) => plan.id !== "trial").map((plan) => `<div class="plan-row ${plan.id === subscription.planId ? "current" : ""}"><div><h4>${escapeHtml(plan.name)} · ¥${(plan.priceCents / 100).toFixed(0)}/月</h4><p>${plan.draftQuota}篇成稿 · ${plan.seatLimit}名成员</p></div>${plan.id === subscription.planId ? "<small>当前套餐</small>" : `<button class="button primary" data-order-plan="${plan.id}" type="button">创建订单</button>`}</div>`).join("");
+    const orderRows = orders.map((order) => `<div class="data-row"><div class="data-row-copy"><strong>${escapeHtml(order.planId)} · ¥${(order.amountCents / 100).toFixed(0)}</strong><small>${escapeHtml(order.status)} · ${new Date(order.createdAt).toLocaleDateString()}</small></div>${order.status === "paid" ? `<button class="button secondary" data-refund-order="${order.id}" type="button">申请退款</button>` : ""}</div>`).join("") || '<p class="form-intro">暂无订单</p>';
+    openModal("套餐与额度", `<section class="saas-section"><div class="saas-section-header"><div><h3>${escapeHtml(subscription.planId)} · ${subscription.draftsRemaining}篇可用</h3><p>本期已使用 ${subscription.draftsUsed}/${subscription.draftQuota} 篇，截止 ${new Date(subscription.periodEnd).toLocaleDateString()}。</p></div></div><div class="usage-bar"><span style="width:${usedPercent}%"></span></div></section><section class="saas-section"><div class="plan-list">${planRows}</div></section><section class="saas-section"><div class="saas-section-header"><h3>订单与退款</h3></div><div class="data-list">${orderRows}</div></section>`, (root) => {
+      $$('[data-order-plan]', root).forEach((button) => button.addEventListener("click", async () => { try { const order = await saasRequest("/orders", { method: "POST", body: { planId: button.dataset.orderPlan, idempotencyKey: uid() } }); showToast(`订单已创建：¥${(order.amountCents / 100).toFixed(0)}，等待支付确认`); closeModal(); await showBillingSettings(); } catch (error) { showToast(error.message, "error"); } }));
+      $$('[data-refund-order]', root).forEach((button) => button.addEventListener("click", async () => { const reason = prompt("请输入退款原因"); if (!reason) return; try { await saasRequest(`/orders/${button.dataset.refundOrder}/refund`, { method: "POST", body: { reason } }); showToast("退款申请已提交"); closeModal(); await showBillingSettings(); } catch (error) { showToast(error.message, "error"); } }));
+    }, true);
+  } catch (error) { showToast(error.message, "error"); }
+}
+
+async function showAdminConsole() {
+  try {
+    const metrics = await saasRequest("/admin/metrics", { organization: false });
+    const totals = metrics.totals;
+    const orderRows = metrics.pendingOrders.map((order) => `<div class="data-row"><div class="data-row-copy"><strong>${escapeHtml(order.plan_id)} · ¥${(order.amount_cents / 100).toFixed(0)}</strong><small>${escapeHtml(order.organization_id)}</small></div><button class="button primary" data-mark-paid="${order.id}" type="button">确认支付</button></div>`).join("") || '<p class="form-intro">没有待支付订单</p>';
+    const refundRows = metrics.pendingRefunds.map((refund) => `<div class="data-row"><div class="data-row-copy"><strong>¥${(refund.amount_cents / 100).toFixed(0)} · ${escapeHtml(refund.reason)}</strong><small>${escapeHtml(refund.organization_id)}</small></div><div class="data-row-actions"><button class="button secondary" data-refund-reject="${refund.id}" type="button">拒绝</button><button class="button primary" data-refund-approve="${refund.id}" type="button">批准</button></div></div>`).join("") || '<p class="form-intro">没有待处理退款</p>';
+    openModal("平台管理", `<section class="saas-section"><div class="saas-grid"><div class="metric"><span>企业</span><strong>${totals.organizations}</strong></div><div class="metric"><span>收入</span><strong>¥${(totals.revenue_cents / 100).toFixed(0)}</strong></div><div class="metric"><span>模型成本</span><strong>$${(totals.cost_microusd / 1_000_000).toFixed(4)}</strong></div></div></section><section class="saas-section"><div class="saas-section-header"><h3>待支付订单</h3></div><div class="data-list">${orderRows}</div></section><section class="saas-section"><div class="saas-section-header"><h3>待处理退款</h3></div><div class="data-list">${refundRows}</div></section>`, (root) => {
+      $$('[data-mark-paid]', root).forEach((button) => button.addEventListener("click", async () => { await saasRequest(`/admin/orders/${button.dataset.markPaid}/paid`, { method: "POST", body: {}, organization: false }); closeModal(); await showAdminConsole(); }));
+      const processRefund = async (id, approved) => { await saasRequest(`/admin/refunds/${id}/process`, { method: "POST", body: { approved }, organization: false }); closeModal(); await showAdminConsole(); };
+      $$('[data-refund-approve]', root).forEach((button) => button.addEventListener("click", () => processRefund(button.dataset.refundApprove, true)));
+      $$('[data-refund-reject]', root).forEach((button) => button.addEventListener("click", () => processRefund(button.dataset.refundReject, false)));
+    }, true);
+  } catch (error) { showToast(error.message, "error"); }
+}
+
 async function clearLocalData() {
-  if (!confirm("将删除此浏览器中的全部项目、图片、品牌档案和临时访问码。此操作无法撤销。")) return;
+  if (!confirm(saasEnabled ? "将清空当前企业的全部云端项目、图片和品牌档案。此操作无法撤销。" : "将删除此浏览器中的全部项目、图片、品牌档案和临时访问码。此操作无法撤销。")) return;
   workspace = createEmptyWorkspace(); deepSeekApiKey = ""; remoteAccessToken = ""; sessionStorage.removeItem("agent-access-token");
+  if (saasEnabled) { await persistWorkspace(); renderAll(); return showToast("企业云端工作区已清空"); }
   const db = await openDatabase();
   await new Promise((resolve, reject) => {
     const request = db.transaction("workspace", "readwrite").objectStore("workspace").delete("current");
@@ -554,7 +751,7 @@ async function clearLocalData() {
 
 function openSidebar() { $("#sidebar-wrap").classList.add("open"); $("#sidebar-scrim").style.display = "block"; }
 function closeSidebar() { $("#sidebar-wrap").classList.remove("open"); $("#sidebar-scrim").style.display = ""; }
-function renderAll() { renderSidebar(); renderAgent(); renderCanvas(); }
+function renderAll() { renderSidebar(); renderAgent(); renderCanvas(); renderSaasChrome(); }
 
 async function init() {
   sessionStorage.removeItem("agent-access-token");
@@ -562,11 +759,26 @@ async function init() {
     $("#loading").innerHTML = "<strong>为防止点击劫持，请在浏览器地址栏中直接打开本站。</strong>";
     return;
   }
-  try { workspace = await loadWorkspace(); }
-  catch { workspace = structuredClone(EMPTY_WORKSPACE); showToast("无法读取旧数据，已打开空白工作区", "error"); }
+  let localWorkspace;
+  try { localWorkspace = await loadLocalWorkspace(); }
+  catch { localWorkspace = structuredClone(EMPTY_WORKSPACE); showToast("无法读取旧数据，已打开空白工作区", "error"); }
+  if (saasEnabled) {
+    await ensureSaasSession();
+    await loadCloudWorkspace();
+    const localHasContent = localWorkspace.projects.length || localWorkspace.brand.companyName;
+    const cloudHasContent = workspace.projects.length || workspace.brand.companyName;
+    if (localHasContent && !cloudHasContent && confirm("检测到这个浏览器中已有本地项目，是否迁移到企业云端？")) {
+      workspace = localWorkspace;
+      await persistWorkspace();
+    }
+  } else workspace = localWorkspace;
   $("#loading").hidden = true; $("#app").hidden = false; renderAll();
+  $("#account-menu").addEventListener("click", showAccountMenu);
   $("#new-project").addEventListener("click", showNewProject);
   $("#brand-settings").addEventListener("click", showBrandSettings);
+  $("#organization-settings").addEventListener("click", showOrganizationSettings);
+  $("#billing-settings").addEventListener("click", showBillingSettings);
+  $("#admin-console").addEventListener("click", showAdminConsole);
   $("#export-backup").addEventListener("click", exportBackup);
   $("#import-backup").addEventListener("change", (event) => event.target.files?.[0] && importBackup(event.target.files[0]));
   $("#clear-local-data").addEventListener("click", () => clearLocalData().catch(() => showToast("清除本地数据失败", "error")));
@@ -578,4 +790,7 @@ async function init() {
   }));
 }
 
-init();
+init().catch((error) => {
+  $("#loading").innerHTML = `<strong>企业工作区无法打开</strong><p>${escapeHtml(error instanceof Error ? error.message : "服务暂时不可用")}</p><button id="retry-init" class="button primary" type="button">重试</button>`;
+  $("#retry-init")?.addEventListener("click", () => location.reload());
+});

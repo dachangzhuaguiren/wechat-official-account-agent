@@ -24,19 +24,26 @@ for (const [source, target] of [
 }
 
 const apiBaseUrl = String(process.env.AGENT_API_BASE_URL || "").replace(/\/$/, "");
+const saasEnabled = process.env.SAAS_ENABLED === "1" && Boolean(apiBaseUrl);
+let apiOrigin = "";
 if (apiBaseUrl) {
   let parsedApiBaseUrl;
   try { parsedApiBaseUrl = new URL(apiBaseUrl); }
   catch { throw new Error("AGENT_API_BASE_URL 必须是有效的 HTTPS URL"); }
   if (parsedApiBaseUrl.protocol !== "https:") throw new Error("GitHub Pages 后端地址必须使用 HTTPS");
+  apiOrigin = parsedApiBaseUrl.origin;
 }
 await writeFile(
   path.join(outputDir, "config.js"),
-  `window.AGENT_CONFIG = Object.freeze(${JSON.stringify({ apiBaseUrl })});\n`,
+  `window.AGENT_CONFIG = Object.freeze(${JSON.stringify({ apiBaseUrl, saasEnabled })});\n`,
   "utf8",
 );
 
-const html = await readFile(path.join(outputDir, "index.html"), "utf8");
+let html = await readFile(path.join(outputDir, "index.html"), "utf8");
+if (apiOrigin) {
+  html = html.replace("connect-src 'self' https://api.deepseek.com", `connect-src 'self' https://api.deepseek.com ${apiOrigin}`);
+  await writeFile(path.join(outputDir, "index.html"), html, "utf8");
+}
 if (!html.includes('./app.js') || !html.includes('./config.js') || !html.includes('./styles.css')) {
   throw new Error("GitHub Pages 产物必须使用相对资源路径");
 }

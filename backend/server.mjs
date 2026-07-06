@@ -5,6 +5,8 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { runAgentOperation } from "./lib/agent-core.mjs";
+import { SaasService } from "./lib/saas-service.mjs";
+import { routeSaasRequest } from "./lib/saas-router.mjs";
 
 const backendDir = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(backendDir, "..");
@@ -109,8 +111,8 @@ function corsHeaders(request, allowedOrigins, trustProxy) {
   if (!allowedOrigins.has(origin)) return null;
   return {
     "access-control-allow-origin": origin,
-    "access-control-allow-methods": "GET, POST, OPTIONS",
-    "access-control-allow-headers": "authorization, content-type",
+    "access-control-allow-methods": "GET, POST, PATCH, PUT, DELETE, OPTIONS",
+    "access-control-allow-headers": "authorization, content-type, x-organization-id, x-idempotency-key",
     "access-control-max-age": "600",
     vary: "Origin",
   };
@@ -186,6 +188,28 @@ function sourceIdentifier(address, auditLogKey) {
   return createHmac("sha256", auditLogKey).update(String(address)).digest("hex").slice(0, 16);
 }
 
+function statusForError(error) {
+  if (Number.isInteger(error?.status)) return error.status;
+  if (error?.code === "PAYLOAD_TOO_LARGE") return 413;
+  if (["INVALID_INPUT", "INVALID_JSON"].includes(error?.code)) return 400;
+  if (error?.code === "UNAUTHENTICATED" || error?.code === "INVALID_CREDENTIALS") return 401;
+  if (error?.code === "FORBIDDEN") return 403;
+  if (["CONFLICT", "VERSION_CONFLICT", "INVALID_STATE", "DUPLICATE_REQUEST"].includes(error?.code)) return 409;
+  if (error?.code === "NOT_FOUND" || error?.code === "USER_NOT_FOUND") return 404;
+  if (["QUOTA_EXCEEDED", "SEAT_LIMIT"].includes(error?.code)) return 429;
+  if (error?.code === "SUBSCRIPTION_REQUIRED") return 402;
+  if (error?.code === "CONFIG_ERROR") return 503;
+  if (error?.code === "PROVIDER_ERROR") return 502;
+  return 500;
+}
+
+function usageCostMicrousd(usage, env) {
+  const pro = String(usage.model || "").toLowerCase().includes("pro");
+  const inputPrice = Number(env.AGENT_INPUT_PRICE_PER_MILLION_USD || (pro ? 0.435 : 0.14));
+  const outputPrice = Number(env.AGENT_OUTPUT_PRICE_PER_MILLION_USD || (pro ? 0.87 : 0.28));
+  return Math.max(0, Math.round(usage.inputTokens * inputPrice + usage.outputTokens * outputPrice));
+}
+
 export function createServer(options = {}) {
   const agentEnv = options.agentEnv ?? process.env;
   const rateLimitMax = boundedNumber(options.rateLimitMax ?? agentEnv.RATE_LIMIT_MAX, 30, { min: 1, max: 10_000 });
@@ -205,6 +229,15 @@ export function createServer(options = {}) {
   const authFailuresByAddress = new Map();
   const auditLogKey = String(options.auditLogKey ?? agentEnv.AUDIT_LOG_KEY ?? "");
   const securityLogger = options.securityLogger ?? ((event) => console.warn(JSON.stringify({ timestamp: new Date().toISOString(), ...event })));
+  const saasEnabled = options.saasEnabled ?? agentEnv.SAAS_ENABLED === "1";
+  const ownsSaasService = saasEnabled && !options.saasService;
+  const saasService = options.saasService ?? (saasEnabled ? new SaasService({
+    databasePath: agentEnv.SAAS_DATABASE_PATH || path.join(projectRoot, "data", "saas.sqlite"),
+    sessionDays: agentEnv.SAAS_SESSION_DAYS,
+    bootstrapAdminEmail: agentEnv.SAAS_BOOTSTRAP_ADMIN_EMAIL,
+    bootstrapAdminToken: agentEnv.SAAS_BOOTSTRAP_ADMIN_TOKEN,
+  }) : undefined);
+  const saasAuthAttempts = new Map();
   let globalBucket = { startedAt: 0, count: 0 };
 
   const server = http.createServer(async (request, response) => {
@@ -222,7 +255,27 @@ export function createServer(options = {}) {
     }
 
     if (request.method === "GET" && url.pathname === "/api/health") {
-      return json(response, 200, exposeHealthDetails ? { ok: true, providerMode, accessProtected: accessToken.length >= 32 } : { ok: true }, cors);
+      return json(response, 200, exposeHealthDetails ? { ok: true, providerMode, saasEnabled, accessProtected: saasEnabled || accessToken.length >= 32 } : { ok: true }, cors);
+    }
+
+    if (saasEnabled && url.pathname.startsWith("/api/saas/")) {
+      const requestId = randomUUID();
+      const address = clientAddress(request, trustProxy);
+      const authEndpoint = request.method === "POST" && ["/api/saas/login", "/api/saas/register"].includes(url.pathname);
+      if (authEndpoint) {
+        const limit = consumeRateBucket(saasAuthAttempts, address, Date.now(), authRateLimitWindowMs, authRateLimitMax, rateLimitMaxBuckets);
+        if (limit.limited) return json(response, 429, { error: "登录尝试过于频繁，请稍后重试", requestId }, { ...cors, "retry-after": String(limit.retryAfter) });
+      }
+      if (["POST", "PATCH", "PUT"].includes(request.method || "") && !acceptsJson(request)) return json(response, 415, { error: "仅支持 application/json 请求", requestId }, cors);
+      try {
+        const routed = await routeSaasRequest({ request, url, service: saasService, readJson });
+        if (routed) return json(response, routed.status, routed.body, { ...cors, "x-request-id": requestId });
+      } catch (error) {
+        const status = statusForError(error);
+        securityLogger({ event: "saas_request_failed", status, code: error?.code || "UNEXPECTED", requestId, path: url.pathname });
+        const message = status < 500 && error instanceof Error ? error.message : "SaaS 服务处理失败";
+        return json(response, status, { error: message, code: error?.code, requestId, ...(error?.currentVersion === undefined ? {} : { currentVersion: error.currentVersion }) }, { ...cors, "x-request-id": requestId, ...(status === 401 ? { "www-authenticate": "Bearer" } : {}) });
+      }
     }
 
     const operation = url.pathname.match(/^\/api\/agent\/(interview|directions|draft|rewrite|audit)$/)?.[1];
@@ -232,21 +285,33 @@ export function createServer(options = {}) {
       const address = clientAddress(request, trustProxy);
       const sourceId = sourceIdentifier(address, auditLogKey);
       const eventContext = { requestId, operation, ...(sourceId ? { sourceId } : {}) };
+      let saasContext;
+      const idempotencyKey = String(request.headers["x-idempotency-key"] || "").trim();
 
-      const localUnauthenticatedAgent = allowsLocalUnauthenticatedAgent(request, allowUnauthenticatedAgent, trustProxy);
-      if (providerMode !== "mock" && !accessToken && !localUnauthenticatedAgent) {
-        return json(response, 503, { error: "真实 AI 服务尚未完成访问保护配置" }, cors);
+      if (saasEnabled) {
+        try {
+          saasContext = saasService.reserveAgentOperation(bearerToken(request), String(request.headers["x-organization-id"] || ""), operation, idempotencyKey);
+        } catch (error) {
+          const status = statusForError(error);
+          securityLogger({ event: "saas_agent_authorization_failed", status, code: error?.code || "UNEXPECTED", ...eventContext });
+          return json(response, status, { error: error instanceof Error ? error.message : "无法执行 Agent 操作", code: error?.code, requestId }, { ...cors, "x-request-id": requestId, ...(status === 401 ? { "www-authenticate": "Bearer" } : {}) });
+        }
+      } else {
+        const localUnauthenticatedAgent = allowsLocalUnauthenticatedAgent(request, allowUnauthenticatedAgent, trustProxy);
+        if (providerMode !== "mock" && !accessToken && !localUnauthenticatedAgent) {
+          return json(response, 503, { error: "真实 AI 服务尚未完成访问保护配置" }, cors);
+        }
+        if (providerMode !== "mock" && accessToken && accessToken.length < 32) {
+          return json(response, 503, { error: "真实 AI 服务访问码强度不足" }, cors);
+        }
+        if (accessToken && !tokensEqual(bearerToken(request), accessToken)) {
+          const authLimit = consumeRateBucket(authFailuresByAddress, address, now, authRateLimitWindowMs, authRateLimitMax, rateLimitMaxBuckets);
+          const status = authLimit.limited ? 429 : 401;
+          securityLogger({ event: authLimit.limited ? "auth_rate_limited" : "authentication_failed", status, ...eventContext });
+          return json(response, status, { error: authLimit.limited ? "认证尝试过于频繁，请稍后重试" : "访问码无效", requestId }, { ...cors, ...(authLimit.limited ? { "retry-after": String(authLimit.retryAfter) } : { "www-authenticate": "Bearer" }) });
+        }
+        authFailuresByAddress.delete(address);
       }
-      if (providerMode !== "mock" && accessToken && accessToken.length < 32) {
-        return json(response, 503, { error: "真实 AI 服务访问码强度不足" }, cors);
-      }
-      if (accessToken && !tokensEqual(bearerToken(request), accessToken)) {
-        const authLimit = consumeRateBucket(authFailuresByAddress, address, now, authRateLimitWindowMs, authRateLimitMax, rateLimitMaxBuckets);
-        const status = authLimit.limited ? 429 : 401;
-        securityLogger({ event: authLimit.limited ? "auth_rate_limited" : "authentication_failed", status, ...eventContext });
-        return json(response, status, { error: authLimit.limited ? "认证尝试过于频繁，请稍后重试" : "访问码无效", requestId }, { ...cors, ...(authLimit.limited ? { "retry-after": String(authLimit.retryAfter) } : { "www-authenticate": "Bearer" }) });
-      }
-      authFailuresByAddress.delete(address);
       if (!acceptsJson(request)) return json(response, 415, { error: "仅支持 application/json 请求" }, cors);
 
       if (!globalBucket.startedAt || now - globalBucket.startedAt >= rateLimitWindowMs) globalBucket = { startedAt: now, count: 0 };
@@ -263,13 +328,14 @@ export function createServer(options = {}) {
       }
 
       try {
-        return json(response, 200, await runAgentOperation(operation, await readJson(request), operationEnv), { ...cors, "x-request-id": requestId });
+        const result = await runAgentOperation(operation, await readJson(request), operationEnv, { onUsage: (usage) => {
+          if (saasContext) saasService.recordUsage(saasContext, { ...usage, costMicrousd: usageCostMicrousd(usage, operationEnv), requestId });
+        } });
+        if (saasContext) saasService.commitAgentOperation(saasContext, operation, idempotencyKey);
+        return json(response, 200, result, { ...cors, "x-request-id": requestId });
       } catch (error) {
-        const status = error?.code === "PAYLOAD_TOO_LARGE" ? 413
-          : ["INVALID_INPUT", "INVALID_JSON"].includes(error?.code) ? 400
-            : error?.code === "CONFIG_ERROR" ? 503
-              : error?.code === "PROVIDER_ERROR" ? 502
-                : 500;
+        if (saasContext) saasService.releaseAgentOperation(saasContext, operation, idempotencyKey);
+        const status = statusForError(error);
         securityLogger({ event: "agent_request_failed", status, code: error?.code || "UNEXPECTED", name: error?.name || "Error", ...eventContext });
         const errorMessage = status < 500 && error instanceof Error ? error.message
           : status === 502 ? "AI 服务暂时不可用，请稍后重试"
@@ -282,6 +348,11 @@ export function createServer(options = {}) {
     const asset = staticFiles.get(url.pathname);
     if (request.method === "GET" && asset) {
       try {
+        if (url.pathname === "/config.js" && saasEnabled) {
+          const publicApiBaseUrl = String(agentEnv.PUBLIC_API_BASE_URL || "").replace(/\/$/, "");
+          response.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff" });
+          return response.end(`window.AGENT_CONFIG = Object.freeze(${JSON.stringify({ apiBaseUrl: publicApiBaseUrl, saasEnabled: true })});\n`);
+        }
         const body = await readFile(path.join(projectRoot, asset[0]));
         response.writeHead(200, {
           "content-type": asset[1],
@@ -306,6 +377,7 @@ export function createServer(options = {}) {
   server.timeout = boundedNumber(options.socketTimeout ?? agentEnv.SOCKET_TIMEOUT_MS, 65_000, { min: 5_000, max: 300_000 });
   server.maxHeadersCount = boundedNumber(options.maxHeadersCount ?? agentEnv.MAX_HEADERS_COUNT, 100, { min: 20, max: 1_000 });
   server.maxRequestsPerSocket = boundedNumber(options.maxRequestsPerSocket ?? agentEnv.MAX_REQUESTS_PER_SOCKET, 100, { min: 1, max: 1_000 });
+  if (ownsSaasService) server.once("close", () => saasService.close());
   return server;
 }
 
